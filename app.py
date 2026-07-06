@@ -1872,8 +1872,12 @@ def screen_review():
     manager_turns = [m for m in st.session_state.messages if m["role"] == "manager"]
     if not st.session_state.messages or len(manager_turns) == 0:
         st.warning("Диалог слишком короткий для анализа. Вернитесь и напишите хотя бы пару сообщений.")
-        if st.button("← Вернуться к диалогу"):
+        if st.button("← Вернуться к диалогу", key="back_short_dialog"):
             st.session_state.screen = "chat" if st.session_state.mode == "chat" else "call"
+            st.session_state.deal_closed = False
+            st.session_state.auto_ended = False
+            st.session_state.review_result = None
+            st.session_state.review_error = None
             st.rerun()
         return
 
@@ -1882,8 +1886,11 @@ def screen_review():
             f"Провайдер **{st.session_state.api_provider}** не настроен — введите API-ключ в боковой панели слева, "
             "чтобы получить ИИ-оценку диалога."
         )
-        if st.button("← Вернуться к диалогу"):
+        if st.button("← Вернуться к диалогу", key="back_no_api"):
             st.session_state.screen = "chat" if st.session_state.mode == "chat" else "call"
+            st.session_state.deal_closed = False
+            st.session_state.review_result = None
+            st.session_state.review_error = None
             st.rerun()
         return
 
@@ -1902,8 +1909,11 @@ def screen_review():
                 st.session_state.review_error = None
                 st.rerun()
         with col_back:
-            if st.button("← Вернуться к диалогу", use_container_width=True):
+            if st.button("← Вернуться к диалогу", use_container_width=True, key="back_api_error"):
                 st.session_state.screen = "chat" if st.session_state.mode == "chat" else "call"
+                st.session_state.deal_closed = False
+                st.session_state.review_result = None
+                st.session_state.review_error = None
                 st.rerun()
         return
 
