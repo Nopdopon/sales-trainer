@@ -42,6 +42,12 @@ try:
 except ImportError:
     GEMINI_AVAILABLE = False
 
+try:
+    from streamlit_mic_recorder import speech_to_text
+    MIC_AVAILABLE = True
+except ImportError:
+    MIC_AVAILABLE = False
+
 
 # ============================================================
 #  КОНФИГ СТРАНИЦЫ
@@ -1645,17 +1651,58 @@ def screen_chat():
         return
 
     if not st.session_state.deal_closed:
-        with st.form(key="chat_form", clear_on_submit=True):
-            col_in, col_btn = st.columns([5, 1])
-            with col_in:
-                user_text = st.text_input("Ваше сообщение", placeholder="Напишите ответ клиенту...", label_visibility="collapsed")
-            with col_btn:
-                submitted = st.form_submit_button("Отправить ➤", use_container_width=True, type="primary")
-        if submitted and user_text:
-            error = manager_send(user_text, persona)
-            if error:
-                st.error(f"Не удалось получить ответ клиента: {error}")
-            st.rerun()
+        if st.session_state.mode == "call" and MIC_AVAILABLE:
+            # ── Голосовой ввод для режима "Телефонный звонок" ──
+            st.markdown("""
+            <div style="background:rgba(15,15,36,0.7);border:1px solid #252545;
+                        border-radius:14px;padding:14px 16px;margin-bottom:8px;">
+                <div style="font-size:12px;color:#505070;letter-spacing:1px;margin-bottom:8px;">
+                    🎙️ ГОЛОСОВОЙ РЕЖИМ — нажмите кнопку и говорите
+                </div>
+            """, unsafe_allow_html=True)
+            voice_text = speech_to_text(
+                language="ru",
+                start_prompt="🎤 Нажмите, чтобы говорить",
+                stop_prompt="🛑 Отправить реплику",
+                just_once=True,
+                key="voice_input_chat",
+            )
+            st.markdown("</div>", unsafe_allow_html=True)
+
+            if voice_text:
+                error = manager_send(voice_text, persona)
+                if error:
+                    st.error(f"Не удалось получить ответ клиента: {error}")
+                st.rerun()
+
+        elif st.session_state.mode == "call" and not MIC_AVAILABLE:
+            # Пакет не установлен — показываем подсказку и стандартный ввод
+            st.warning("📦 Установите `streamlit-mic-recorder` для голосового ввода: `pip install streamlit-mic-recorder`")
+            with st.form(key="chat_form_fallback", clear_on_submit=True):
+                col_in, col_btn = st.columns([5, 1])
+                with col_in:
+                    user_text = st.text_input("Ваша реплика", placeholder="Что вы скажете клиенту?", label_visibility="collapsed")
+                with col_btn:
+                    submitted = st.form_submit_button("Отправить ➤", use_container_width=True, type="primary")
+            if submitted and user_text:
+                error = manager_send(user_text, persona)
+                if error:
+                    st.error(f"Не удалось получить ответ клиента: {error}")
+                st.rerun()
+
+        else:
+            # ── Текстовый ввод для режима "Текстовый чат" ──
+            with st.form(key="chat_form", clear_on_submit=True):
+                col_in, col_btn = st.columns([5, 1])
+                with col_in:
+                    user_text = st.text_input("Ваше сообщение", placeholder="Напишите ответ клиенту...", label_visibility="collapsed")
+                with col_btn:
+                    submitted = st.form_submit_button("Отправить ➤", use_container_width=True, type="primary")
+            if submitted and user_text:
+                error = manager_send(user_text, persona)
+                if error:
+                    st.error(f"Не удалось получить ответ клиента: {error}")
+                st.rerun()
 
         st.markdown("")
         if st.button("🏁 Завершить сделку и получить оценку", use_container_width=True, type="secondary"):
@@ -1790,17 +1837,43 @@ def screen_call():
     st.divider()
 
     if st.session_state.call_active:
-        with st.form(key="call_form", clear_on_submit=True):
-            col_in, col_btn = st.columns([5, 1])
-            with col_in:
-                user_text = st.text_input("Ваша реплика", placeholder="Что вы скажете клиенту?", label_visibility="collapsed")
-            with col_btn:
-                submitted = st.form_submit_button("Сказать ➤", use_container_width=True, type="primary")
-        if submitted and user_text:
-            error = manager_send(user_text, persona)
-            if error:
-                st.error(f"Не удалось получить ответ клиента: {error}")
-            st.rerun()
+        if MIC_AVAILABLE:
+            # ── Голосовой ввод ──────────────────────────────────
+            st.markdown("""
+            <div style="background:rgba(15,15,36,0.7);border:1px solid #252545;
+                        border-radius:14px;padding:14px 16px;margin-bottom:8px;">
+                <div style="font-size:12px;color:#505070;letter-spacing:1px;margin-bottom:8px;">
+                    🎙️ ГОЛОСОВОЙ РЕЖИМ — нажмите кнопку и говорите
+                </div>
+            """, unsafe_allow_html=True)
+            voice_text = speech_to_text(
+                language="ru",
+                start_prompt="🎤 Нажмите, чтобы говорить",
+                stop_prompt="🛑 Отправить реплику",
+                just_once=True,
+                key="voice_input_call",
+            )
+            st.markdown("</div>", unsafe_allow_html=True)
+
+            if voice_text:
+                error = manager_send(voice_text, persona)
+                if error:
+                    st.error(f"Не удалось получить ответ клиента: {error}")
+                st.rerun()
+        else:
+            # Пакет не установлен — текстовый fallback
+            st.warning("📦 Установите `streamlit-mic-recorder` для голосового ввода: `pip install streamlit-mic-recorder`")
+            with st.form(key="call_form", clear_on_submit=True):
+                col_in, col_btn = st.columns([5, 1])
+                with col_in:
+                    user_text = st.text_input("Ваша реплика", placeholder="Что вы скажете клиенту?", label_visibility="collapsed")
+                with col_btn:
+                    submitted = st.form_submit_button("Сказать ➤", use_container_width=True, type="primary")
+            if submitted and user_text:
+                error = manager_send(user_text, persona)
+                if error:
+                    st.error(f"Не удалось получить ответ клиента: {error}")
+                st.rerun()
 
         st.markdown("")
         col_a, col_b = st.columns(2)
