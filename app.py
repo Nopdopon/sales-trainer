@@ -48,6 +48,55 @@ try:
 except ImportError:
     MIC_AVAILABLE = False
 
+import asyncio
+import io
+
+try:
+    import edge_tts
+    TTS_AVAILABLE = True
+except ImportError:
+    TTS_AVAILABLE = False
+
+
+# ============================================================
+#  TTS — ОЗВУЧКА РЕПЛИК ИИ-КЛИЕНТА (edge-tts, бесплатно)
+# ============================================================
+
+TTS_VOICE_MALE   = "ru-RU-DmitryNeural"
+TTS_VOICE_FEMALE = "ru-RU-SvetlanaNeural"
+TTS_RATE         = "+15%"
+
+
+async def _tts_generate(text: str, voice: str) -> bytes:
+    """Асинхронно генерирует MP3-аудио через edge-tts и возвращает байты."""
+    communicate = edge_tts.Communicate(text=text, voice=voice, rate=TTS_RATE)
+    buf = io.BytesIO()
+    async for chunk in communicate.stream():
+        if chunk["type"] == "audio":
+            buf.write(chunk["data"])
+    buf.seek(0)
+    return buf.read()
+
+
+def tts_speak(text: str, gender: str) -> Optional[bytes]:
+    """
+    Синхронная обёртка: запускает асинхронную генерацию TTS через asyncio.run().
+    Возвращает байты MP3 или None при ошибке / если пакет не установлен.
+    Очищает текст от служебных маркеров (*действие*, stage directions и т.п.) перед озвучкой.
+    """
+    if not TTS_AVAILABLE:
+        return None
+    import re
+    # Убираем ремарки вида *бросает трубку*, *кладёт трубку* — они не нужны в аудио
+    clean = re.sub(r'\*[^*]+\*', '', text).strip()
+    if not clean:
+        return None
+    voice = TTS_VOICE_FEMALE if gender == "female" else TTS_VOICE_MALE
+    try:
+        return asyncio.run(_tts_generate(clean, voice))
+    except Exception:
+        return None
+
 
 # ============================================================
 #  КОНФИГ СТРАНИЦЫ
@@ -104,6 +153,7 @@ class Persona:
     name: str
     emoji: str
     avatar_url: str          # URL фото или "" для эмодзи-аватара
+    gender: str              # "male" | "female" — для выбора TTS-голоса
     level: str               # "Новичок" | "Опытный" | "Хардкор"
     level_color: str
     call_type: str           # "Тёплый" | "Холодный"
@@ -125,6 +175,7 @@ CLIENTS_DB: Dict[str, Persona] = {
         name="Николай",
         emoji="🙂",
         avatar_url="",
+        gender="male",
         level="Новичок",
         level_color="#22c55e",
         call_type="Тёплый",
@@ -159,6 +210,7 @@ CLIENTS_DB: Dict[str, Persona] = {
         name="Михаил",
         emoji="😟",
         avatar_url="https://images.unsplash.com/photo-1500648767791-00dcc994a43e?w=150",
+        gender="male",
         level="Новичок",
         level_color="#22c55e",
         call_type="Тёплый",
@@ -194,6 +246,7 @@ CLIENTS_DB: Dict[str, Persona] = {
         name="Тамара Ивановна",
         emoji="🧐",
         avatar_url="",
+        gender="female",
         level="Опытный",
         level_color="#f59e0b",
         call_type="Холодный",
@@ -228,6 +281,7 @@ CLIENTS_DB: Dict[str, Persona] = {
         name="Валерий",
         emoji="😤",
         avatar_url="https://images.unsplash.com/photo-1492562080023-ab3db95bfbce?w=150",
+        gender="male",
         level="Опытный",
         level_color="#f59e0b",
         call_type="Холодный",
@@ -262,6 +316,7 @@ CLIENTS_DB: Dict[str, Persona] = {
         name="Артур",
         emoji="😠",
         avatar_url="",
+        gender="male",
         level="Хардкор",
         level_color="#ef4444",
         call_type="Холодный",
@@ -296,6 +351,7 @@ CLIENTS_DB: Dict[str, Persona] = {
         name="Ирина",
         emoji="💼",
         avatar_url="https://images.unsplash.com/photo-1573496359142-b8d87734a5a2?w=150",
+        gender="female",
         level="Опытный",
         level_color="#f59e0b",
         call_type="Холодный",
@@ -330,6 +386,7 @@ CLIENTS_DB: Dict[str, Persona] = {
         name="Артём",
         emoji="🤨",
         avatar_url="https://images.unsplash.com/photo-1519085360753-af0119f7cbe7?w=150",
+        gender="male",
         level="Хардкор",
         level_color="#ef4444",
         call_type="Тёплый",
@@ -525,7 +582,8 @@ def init_session_state():
         "turn_count": 0,
         "auto_ended": False,
         "filter_topic": None,       # выбранная тема на экране меню
-        "filter_call_type": None,   # выбранный тип звонка на экране меню              # True, если диалог завершился автоматически (стресс/терпение)
+        "filter_call_type": None,   # выбранный тип звонка на экране меню
+        "last_tts_audio": None,     # байты MP3 последней реплики ИИ-клиента для autoplay              # True, если диалог завершился автоматически (стресс/терпение)
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -1570,6 +1628,10 @@ def manager_send(text: str, persona: Persona) -> Optional[str]:
     })
     st.session_state.turn_count += 1
 
+    # Озвучка ответа ИИ-клиента
+    audio_bytes = tts_speak(reply, persona.gender)
+    st.session_state.last_tts_audio = audio_bytes   # None если TTS недоступен
+
     # Повторная проверка уже после ответа ИИ — на случай если стресс вырос ровно до порога на этом шаге
     if check_auto_end(persona):
         trigger_auto_end(persona)
@@ -1643,6 +1705,11 @@ def screen_chat():
                 </div>""", unsafe_allow_html=True)
 
     st.divider()
+
+    # Автовоспроизведение последней реплики ИИ-клиента
+    if st.session_state.get("last_tts_audio"):
+        st.audio(st.session_state.last_tts_audio, format="audio/mp3", autoplay=True)
+        st.session_state.last_tts_audio = None   # сбрасываем, чтобы не проигрывать повторно при rerun
 
     if st.session_state.auto_ended:
         st.error(f"💬 {persona.name} прервал чат — переходим к разбору полётов.")
@@ -1830,6 +1897,11 @@ def screen_call():
     st.markdown("")
 
     render_call_log(persona)
+
+    # Автовоспроизведение последней реплики ИИ-клиента
+    if st.session_state.get("last_tts_audio"):
+        st.audio(st.session_state.last_tts_audio, format="audio/mp3", autoplay=True)
+        st.session_state.last_tts_audio = None
 
     if st.session_state.call_ended_reason == "auto_hangup":
         st.error(f"📵 {persona.name} прервал разговор автоматически — слишком высокий стресс или много слабых ответов подряд.")
