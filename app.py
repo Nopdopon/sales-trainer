@@ -124,26 +124,6 @@ def _get_default_secret(name: str) -> str:
 
 
 # ============================================================
-#  ПЕРСОНАЖИ
-# ============================================================
-
-@dataclass
-class Persona:
-    key: str
-    name: str
-    emoji: str
-    level: str
-    level_color: str
-    tagline: str
-    description: str
-    system_prompt: str
-    opening_lines: List[str]
-    stress_start: int           # стартовый уровень "стресса"/недовольства клиента (0-100)
-    patience: int                # сколько "слабых" реплик менеджера подряд выдержит, прежде чем психанёт
-    hangup_line: str             # финальная реплика при авто-завершении (стресс/терпение)
-
-
-# ============================================================
 #  КЛИЕНТЫ (CLIENTS_DB)
 # ============================================================
 
@@ -1094,11 +1074,77 @@ class AIClientError(Exception):
     pass
 
 
-def call_ai_client(persona: Persona, history: List[Dict]) -> str:
+# Этот суффикс добавляется к system_prompt КАЖДОГО персонажа.
+# Он инструктирует модель возвращать JSON с полем stress_level,
+# не меняя при этом характер и поведение персонажа.
+_JSON_SUFFIX = """
+
+═══════════════════════════════════════════════════
+ФОРМАТ ОТВЕТА — СТРОГО ОБЯЗАТЕЛЕН:
+Ты ВСЕГДА отвечаешь только валидным JSON-объектом. Никакого текста вне JSON. Никаких markdown-блоков.
+{
+  "response": "Твоя реплика как персонаж (1-4 предложения, живая речь)",
+  "stress_level": <целое число от 0 до 100>
+}
+
+ПРАВИЛА ДЛЯ stress_level (твой внутренний градус раздражения/недовольства):
+- 0–20:   менеджер говорит профессионально, по делу, вежливо — ты доволен или спокоен
+- 21–50:  лёгкое сомнение, менеджер не убедил, но не раздражает
+- 51–75:  менеджер мямлит, уходит от ответа, или ты не видишь выгоды — заметное раздражение
+- 76–100: менеджер хамит, предлагает абсурд (например, «отдайте бесплатно»), лжёт, давит — ты в ярости или вешаешь трубку
+Устанавливай stress_level честно, исходя из качества последней реплики менеджера и общего хода разговора.
+═══════════════════════════════════════════════════"""
+
+
+def _build_system_prompt(persona: Persona) -> str:
+    """Возвращает системный промпт персонажа с добавленным JSON-суффиксом."""
+    return persona.system_prompt + _JSON_SUFFIX
+
+
+def _parse_client_response(raw: str) -> tuple[str, Optional[int]]:
     """
-    Возвращает реплику ИИ-клиента, сгенерированную выбранным провайдером.
-    history: список {"role": "manager"/"client", "text": str} — полный контекст диалога.
-    Бросает AIClientError, если провайдер не настроен или вызов завершился ошибкой.
+    Парсит JSON-ответ ИИ-клиента.
+    Возвращает (text, stress_level).
+    stress_level = None если не удалось распарсить (будет использован старый эвристический метод).
+    Устойчив к markdown-обёртке ```json ... ``` и мусору вокруг JSON.
+    """
+    cleaned = raw.strip()
+
+    # Снимаем markdown-блок если модель всё же добавила его
+    if cleaned.startswith("```"):
+        cleaned = cleaned.strip("`")
+        if cleaned.lower().startswith("json"):
+            cleaned = cleaned[4:]
+        cleaned = cleaned.strip()
+
+    # Вырезаем первый { ... последний } если есть мусор вокруг
+    if not cleaned.startswith("{"):
+        start = cleaned.find("{")
+        end = cleaned.rfind("}")
+        if start != -1 and end > start:
+            cleaned = cleaned[start:end + 1]
+
+    try:
+        data = json.loads(cleaned)
+        text = str(data.get("response", "")).strip()
+        raw_stress = data.get("stress_level")
+        stress = int(raw_stress) if raw_stress is not None else None
+        if stress is not None:
+            stress = max(0, min(100, stress))   # clamp 0–100
+        if not text:
+            # JSON пришёл, но поле response пустое — берём весь raw как текст
+            return raw, None
+        return text, stress
+    except (json.JSONDecodeError, ValueError, TypeError):
+        # Модель не вернула JSON — отдаём raw-текст, стресс обновит эвристика
+        return raw, None
+
+
+def call_ai_client(persona: Persona, history: List[Dict]) -> tuple[str, Optional[int]]:
+    """
+    Возвращает (текст_реплики, stress_level) ИИ-клиента.
+    stress_level = None если ИИ не вернул валидный JSON (будет использована эвристика).
+    Бросает AIClientError при сбое провайдера.
     """
     provider = st.session_state.api_provider
 
@@ -1107,14 +1153,16 @@ def call_ai_client(persona: Persona, history: List[Dict]) -> str:
             raise AIClientError("Пакет `google-genai` не установлен. Выполните: pip install google-genai")
         if not st.session_state.api_key_gemini:
             raise AIClientError("Не указан Gemini API Key. Введите его в боковой панели.")
-        return _call_gemini_client(persona, history)
+        raw = _call_gemini_client(persona, history)
+        return _parse_client_response(raw)
 
     if provider == "OpenAI":
         if not OPENAI_AVAILABLE:
             raise AIClientError("Пакет `openai` не установлен. Выполните: pip install openai")
         if not st.session_state.api_key_openai:
             raise AIClientError("Не указан OpenAI API Key. Введите его в боковой панели.")
-        return _call_openai_client(persona, history)
+        raw = _call_openai_client(persona, history)
+        return _parse_client_response(raw)
 
     raise AIClientError("Неизвестный провайдер ИИ.")
 
@@ -1130,12 +1178,13 @@ def _build_openai_messages(system_prompt: str, history: List[Dict]) -> List[Dict
 def _call_openai_client(persona: Persona, history: List[Dict]) -> str:
     try:
         client = OpenAI(api_key=st.session_state.api_key_openai)
-        messages = _build_openai_messages(persona.system_prompt, history)
+        messages = _build_openai_messages(_build_system_prompt(persona), history)
         resp = client.chat.completions.create(
             model=OPENAI_MODEL,
             messages=messages,
             temperature=0.85,
-            max_tokens=220,
+            max_tokens=350,
+            response_format={"type": "json_object"},
         )
     except Exception as e:
         raise AIClientError(f"Ошибка вызова OpenAI API: {e}")
@@ -1165,9 +1214,10 @@ def _call_gemini_client(persona: Persona, history: List[Dict]) -> str:
             model=GEMINI_MODEL,
             contents=contents,
             config=genai_types.GenerateContentConfig(
-                system_instruction=persona.system_prompt,
+                system_instruction=_build_system_prompt(persona),
                 temperature=0.85,
-                max_output_tokens=300,
+                max_output_tokens=400,
+                response_mime_type="application/json",
             ),
         )
     except AIClientError:
@@ -1608,20 +1658,32 @@ def manager_send(text: str, persona: Persona) -> Optional[str]:
     st.session_state.messages.append({
         "role": "manager", "text": text, "ts": datetime.now().strftime("%H:%M"),
     })
+
+    # Эвристика нужна только для weak_streak (счётчик терпения по тексту менеджера).
+    # Сам стресс будет перезаписан значением от ИИ, если JSON придёт корректно.
     update_stress(text)
 
-    # Если после реплики менеджера лимит уже превышен — клиент обрывает разговор без дополнительного ответа ИИ
+    # Если лимит терпения уже превышен — клиент обрывает без ответа ИИ
     if check_auto_end(persona):
         trigger_auto_end(persona)
         return None
 
     try:
         with st.spinner(f"{persona.name} печатает..."):
-            reply = call_ai_client(persona, st.session_state.messages)
+            reply, ai_stress = call_ai_client(persona, st.session_state.messages)
     except AIClientError as e:
-        # Откатываем последнее сообщение менеджера не нужно — оно остаётся в истории,
-        # но явно показываем ошибку, чтобы пользователь понял, что ответа клиента не будет.
         return str(e)
+
+    # Обновляем стресс: если ИИ вернул stress_level в JSON — используем его (приоритет).
+    # Если нет (ai_stress is None, модель не вернула JSON) — оставляем эвристику как есть.
+    if ai_stress is not None:
+        st.session_state.stress = ai_stress
+        # Пересчитываем weak_streak на основе оценки самого ИИ:
+        # высокий стресс (≥75) — менеджер явно облажался, увеличиваем счётчик
+        if ai_stress >= 75:
+            st.session_state.weak_streak += 1
+        else:
+            st.session_state.weak_streak = 0
 
     st.session_state.messages.append({
         "role": "client", "text": reply, "ts": datetime.now().strftime("%H:%M"),
@@ -1630,9 +1692,9 @@ def manager_send(text: str, persona: Persona) -> Optional[str]:
 
     # Озвучка ответа ИИ-клиента
     audio_bytes = tts_speak(reply, persona.gender)
-    st.session_state.last_tts_audio = audio_bytes   # None если TTS недоступен
+    st.session_state.last_tts_audio = audio_bytes
 
-    # Повторная проверка уже после ответа ИИ — на случай если стресс вырос ровно до порога на этом шаге
+    # Повторная проверка авто-завершения после обновления стресса
     if check_auto_end(persona):
         trigger_auto_end(persona)
 
