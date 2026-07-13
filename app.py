@@ -112,15 +112,20 @@ GEMINI_MODEL = "gemini-2.5-flash"
 OPENAI_MODEL = "gpt-4o-mini"
 
 
-def _get_default_secret(name: str) -> str:
-    """Пытается найти ключ в переменных окружения или в st.secrets, не падая, если их нет."""
-    val = os.environ.get(name, "")
-    if val:
-        return val
-    try:
-        return st.secrets.get(name, "")  # type: ignore[attr-defined]
-    except Exception:
-        return ""
+def _get_proxy_key() -> str:
+    """Читает PROXY_API_KEY из secrets.toml / переменной окружения."""
+    # Приоритет: secrets.toml → env PROXY_API_KEY → env GEMINI_API_KEY (обратная совместимость)
+    for name in ("PROXY_API_KEY", "GEMINI_API_KEY"):
+        val = os.environ.get(name, "")
+        if val:
+            return val
+        try:
+            v = st.secrets.get(name, "")
+            if v:
+                return v
+        except Exception:
+            pass
+    return ""
 
 
 # ============================================================
@@ -553,9 +558,10 @@ def init_session_state():
         "call_active": False,
         "call_start_time": None,
         "call_ended_reason": None,        # None | "manager_ended" | "auto_hangup" | "judge_requested"
-        "api_provider": "Gemini" if GEMINI_AVAILABLE else ("OpenAI" if OPENAI_AVAILABLE else "Gemini"),
-        "api_key_openai": _get_default_secret("OPENAI_API_KEY"),
-        "api_key_gemini": _get_default_secret("GEMINI_API_KEY"),
+        # Провайдер фиксирован — Gemini через PROXY_API_KEY (ключ из secrets.toml)
+        "api_provider": "Gemini",
+        "api_key_openai": "",
+        "api_key_gemini": _get_proxy_key(),
         "review_result": None,
         "review_error": None,
         "deal_closed": False,
@@ -1419,47 +1425,27 @@ with st.sidebar:
         st.rerun()
 
     st.divider()
-    st.markdown("## ⚙️ Настройки ИИ")
 
-    provider_options = ["Gemini", "OpenAI"]
-    st.session_state.api_provider = st.radio(
-        "Провайдер ИИ-клиента и ИИ-судьи",
-        options=provider_options,
-        index=provider_options.index(st.session_state.api_provider)
-        if st.session_state.api_provider in provider_options else 0,
-        help="Используется и для генерации реплик клиента, и для финального разбора полётов.",
-    )
-
-    if st.session_state.api_provider == "Gemini":
-        st.session_state.api_key_gemini = st.text_input(
-            "Gemini API Key", type="password", value=st.session_state.api_key_gemini,
-            placeholder="AIza...",
-            help="Можно также задать через переменную окружения GEMINI_API_KEY или .streamlit/secrets.toml",
-        )
-        if not GEMINI_AVAILABLE:
-            st.error("Пакет `google-genai` не установлен.\n\n`pip install google-genai`")
-        elif not st.session_state.api_key_gemini:
-            st.warning("Введите Gemini API Key, иначе диалог и оценка не будут работать.")
-        else:
-            st.success(f"Gemini подключён ✅ (модель: {GEMINI_MODEL})")
-
-    elif st.session_state.api_provider == "OpenAI":
-        st.session_state.api_key_openai = st.text_input(
-            "OpenAI API Key", type="password", value=st.session_state.api_key_openai,
-            placeholder="sk-...",
-            help="Можно также задать через переменную окружения OPENAI_API_KEY или .streamlit/secrets.toml",
-        )
-        if not OPENAI_AVAILABLE:
-            st.error("Пакет `openai` не установлен.\n\n`pip install openai`")
-        elif not st.session_state.api_key_openai:
-            st.warning("Введите OpenAI API Key, иначе диалог и оценка не будут работать.")
-        else:
-            st.success(f"OpenAI подключён ✅ (модель: {OPENAI_MODEL})")
-
-    st.caption(
-        "🔒 Ключ не сохраняется на диск — хранится только в памяти текущей сессии браузера. "
-        "Чтобы не вводить его каждый раз, задайте переменную окружения или secrets.toml (см. README)."
-    )
+    # --- Статус ИИ-движка (ключ из secrets, без ручного ввода) ---
+    st.markdown("### 🤖 ИИ-движок")
+    _proxy_ok = bool(st.session_state.get("api_key_gemini") or st.session_state.get("api_key_openai"))
+    if _proxy_ok:
+        _active = "Gemini" if st.session_state.get("api_key_gemini") else "OpenAI"
+        st.markdown(f"""
+        <div style="background:rgba(45,205,115,0.1);border:1px solid rgba(45,205,115,0.3);
+                    border-radius:10px;padding:10px 14px;">
+            <div style="color:#2DCD73;font-weight:700;font-size:13px;">✅ Подключён</div>
+            <div style="color:#505070;font-size:12px;margin-top:2px;">{_active} · {GEMINI_MODEL if _active == 'Gemini' else OPENAI_MODEL}</div>
+        </div>
+        """, unsafe_allow_html=True)
+    else:
+        st.markdown("""
+        <div style="background:rgba(255,75,75,0.1);border:1px solid rgba(255,75,75,0.3);
+                    border-radius:10px;padding:10px 14px;">
+            <div style="color:#FF4B4B;font-weight:700;font-size:13px;">⚠️ Ключ не найден</div>
+            <div style="color:#505070;font-size:12px;margin-top:2px;">Добавьте PROXY_API_KEY в secrets.toml</div>
+        </div>
+        """, unsafe_allow_html=True)
 
     st.divider()
     st.markdown("### 📊 Текущая сессия")
@@ -1496,12 +1482,6 @@ def screen_menu():
         <div class="kosmos-logo-sub">Sales Training Simulator</div>
     </div>
     """, unsafe_allow_html=True)
-
-    if not is_configured(st.session_state.api_provider):
-        st.warning(
-            f"⚠️ Провайдер **{st.session_state.api_provider}** не настроен. "
-            "Введите API-ключ в боковой панели слева, иначе диалог с клиентом и оценка не будут работать."
-        )
 
     # ── Шаг 1: выбор темы ──────────────────────────────────
     st.markdown("### Шаг 1 — Выберите тему")
@@ -1728,12 +1708,6 @@ def screen_chat():
             st.session_state.screen = "menu"
             st.rerun()
 
-    if not is_configured(st.session_state.api_provider):
-        st.error(
-            f"Провайдер **{st.session_state.api_provider}** не настроен — введите API-ключ в боковой панели слева, "
-            "чтобы начать диалог."
-        )
-
     render_stress_bar(persona)
     st.divider()
 
@@ -1871,12 +1845,6 @@ def screen_call():
             st.session_state.screen = "menu"
             st.rerun()
 
-    if not is_configured(st.session_state.api_provider):
-        st.error(
-            f"Провайдер **{st.session_state.api_provider}** не настроен — введите API-ключ в боковой панели слева, "
-            "чтобы принять вызов."
-        )
-
     # Авто-завершение после rerun — уводим на review
     if st.session_state.auto_ended:
         render_call_log(persona)
@@ -1920,8 +1888,7 @@ def screen_call():
         st.markdown("")
         c1, c2, c3 = st.columns([1, 1, 1])
         with c2:
-            if st.button("✅ Принять вызов", use_container_width=True, type="primary",
-                         disabled=not is_configured(st.session_state.api_provider)):
+            if st.button("✅ Принять вызов", use_container_width=True, type="primary"):
                 st.session_state.call_active = True
                 st.session_state.call_start_time = time.time()
                 opening = random.choice(persona.opening_lines)
@@ -1931,29 +1898,35 @@ def screen_call():
                 st.rerun()
         return
 
-    # Звонок идёт или завершён вручную
-    elapsed = int(time.time() - st.session_state.call_start_time) if st.session_state.call_start_time else 0
-    mins, secs = divmod(elapsed, 60)
-    status_dot = "🟢" if st.session_state.call_active else "🔴"
-    status_label = "ИДЁт ЗВОНОК" if st.session_state.call_active else "ЗВОНОК ЗАВЕРШЁН"
+    @st.fragment(run_every=1.0)
+    def _render_call_timer():
+        """Тикает каждую секунду независимо от остального экрана — не мешает голосовому вводу."""
+        if not st.session_state.call_start_time:
+            return
+        elapsed = int(time.time() - st.session_state.call_start_time)
+        mins, secs = divmod(elapsed, 60)
+        status_dot = "🟢" if st.session_state.call_active else "🔴"
+        status_label = "ИДЁт ЗВОНОК" if st.session_state.call_active else "ЗВОНОК ЗАВЕРШЁН"
 
-    if persona.avatar_url:
-        av_call = (
-            f'<img src="{persona.avatar_url}" '
-            f'style="width:72px;height:72px;border-radius:50%;object-fit:cover;'
-            f'display:block;margin:0 auto 8px auto;border:2px solid {persona.level_color}55;">'
-        )
-    else:
-        av_call = f'<div class="call-avatar" style="font-size:64px;">{persona.emoji}</div>'
+        if persona.avatar_url:
+            av_call = (
+                f'<img src="{persona.avatar_url}" '
+                f'style="width:72px;height:72px;border-radius:50%;object-fit:cover;'
+                f'display:block;margin:0 auto 8px auto;border:2px solid {persona.level_color}55;">'
+            )
+        else:
+            av_call = f'<div class="call-avatar" style="font-size:64px;">{persona.emoji}</div>'
 
-    st.markdown(f"""
-    <div class="call-screen">
-        {av_call}
-        <div style="font-size:20px;font-weight:800;color:#e8e8ff;">{persona.name}</div>
-        <div class="call-status" style="margin-top:6px;">{status_dot} &nbsp; {status_label}</div>
-        <div class="call-timer">{mins:02d}:{secs:02d}</div>
-    </div>
-    """, unsafe_allow_html=True)
+        st.markdown(f"""
+        <div class="call-screen">
+            {av_call}
+            <div style="font-size:20px;font-weight:800;color:#e8e8ff;">{persona.name}</div>
+            <div class="call-status" style="margin-top:6px;">{status_dot} &nbsp; {status_label}</div>
+            <div class="call-timer">{mins:02d}:{secs:02d}</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    _render_call_timer()
 
     render_stress_bar(persona)
     st.markdown("")
@@ -2083,19 +2056,6 @@ def screen_review():
             st.session_state.screen = "chat" if st.session_state.mode == "chat" else "call"
             st.session_state.deal_closed = False
             st.session_state.auto_ended = False
-            st.session_state.review_result = None
-            st.session_state.review_error = None
-            st.rerun()
-        return
-
-    if not is_configured(st.session_state.api_provider):
-        st.error(
-            f"Провайдер **{st.session_state.api_provider}** не настроен — введите API-ключ в боковой панели слева, "
-            "чтобы получить ИИ-оценку диалога."
-        )
-        if st.button("← Вернуться к диалогу", key="back_no_api"):
-            st.session_state.screen = "chat" if st.session_state.mode == "chat" else "call"
-            st.session_state.deal_closed = False
             st.session_state.review_result = None
             st.session_state.review_error = None
             st.rerun()
