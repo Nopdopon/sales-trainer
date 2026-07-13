@@ -1099,6 +1099,7 @@ _JSON_SUFFIX = """
 - 51–75:  менеджер мямлит, уходит от ответа, или ты не видишь выгоды — заметное раздражение
 - 76–100: менеджер хамит, предлагает абсурд (например, «отдайте бесплатно»), лжёт, давит — ты в ярости или вешаешь трубку
 Устанавливай stress_level честно, исходя из качества последней реплики менеджера и общего хода разговора.
+ВАЖНО: держи "response" компактным (не более 3-4 коротких предложений), чтобы гарантированно уложиться в лимит ответа.
 ═══════════════════════════════════════════════════"""
 
 
@@ -1107,12 +1108,21 @@ def _build_system_prompt(persona: Persona) -> str:
     return persona.system_prompt + _JSON_SUFFIX
 
 
+# Заглушка, которую видит и пользователь, и (что важнее) следующий запрос к модели,
+# если JSON от ИИ не удалось распарсить. НИКОГДА не кладём сырой/битый текст модели
+# ни в чат, ни, тем более, обратно в историю диалога — иначе модель начинает
+# копировать свой же кривой вывод в следующих репликах (снежный ком из скриншота).
+_FALLBACK_REPLY = "*секунду думает*"
+
+
 def _parse_client_response(raw: str) -> tuple[str, Optional[int]]:
     """
     Парсит JSON-ответ ИИ-клиента.
     Возвращает (text, stress_level).
     stress_level = None если не удалось распарсить (будет использован старый эвристический метод).
-    Устойчив к markdown-обёртке ```json ... ``` и мусору вокруг JSON.
+    Устойчив к markdown-обёртке ```json ... ``` , мусору вокруг JSON и обрезанному по лимиту токенов ответу.
+    ВАЖНО: при неудаче парсинга НИКОГДА не возвращает сырой текст модели — только безопасную заглушку,
+    чтобы битый JSON не утёк ни в интерфейс, ни в историю диалога, отправляемую следующим запросом.
     """
     cleaned = raw.strip()
 
@@ -1123,7 +1133,7 @@ def _parse_client_response(raw: str) -> tuple[str, Optional[int]]:
             cleaned = cleaned[4:]
         cleaned = cleaned.strip()
 
-    # Вырезаем первый { ... последний } если есть мусор вокруг
+    # Вырезаем первый { ... последний } если есть мусор вокруг (например преамбула "Here is the JSON...")
     if not cleaned.startswith("{"):
         start = cleaned.find("{")
         end = cleaned.rfind("}")
@@ -1138,12 +1148,14 @@ def _parse_client_response(raw: str) -> tuple[str, Optional[int]]:
         if stress is not None:
             stress = max(0, min(100, stress))   # clamp 0–100
         if not text:
-            # JSON пришёл, но поле response пустое — берём весь raw как текст
-            return raw, None
+            # JSON пришёл, но поле response пустое — используем безопасную заглушку
+            return _FALLBACK_REPLY, stress
         return text, stress
     except (json.JSONDecodeError, ValueError, TypeError):
-        # Модель не вернула JSON — отдаём raw-текст, стресс обновит эвристика
-        return raw, None
+        # Модель не вернула валидный JSON (часто из-за обрезки по max_output_tokens
+        # или добавленной перед JSON преамбулы). НЕ отдаём raw дальше — это ломает
+        # и UI, и следующий запрос к модели, попадая в историю диалога.
+        return _FALLBACK_REPLY, None
 
 
 def call_ai_client(persona: Persona, history: List[Dict]) -> tuple[str, Optional[int]]:
@@ -1189,7 +1201,7 @@ def _call_openai_client(persona: Persona, history: List[Dict]) -> str:
             model=OPENAI_MODEL,
             messages=messages,
             temperature=0.85,
-            max_tokens=350,
+            max_tokens=600,
             response_format={"type": "json_object"},
         )
     except Exception as e:
@@ -1222,8 +1234,9 @@ def _call_gemini_client(persona: Persona, history: List[Dict]) -> str:
             config=genai_types.GenerateContentConfig(
                 system_instruction=_build_system_prompt(persona),
                 temperature=0.85,
-                max_output_tokens=400,
+                max_output_tokens=800,          # было 400 — обрезало JSON на длинных репликах
                 response_mime_type="application/json",
+                thinking_config=genai_types.ThinkingConfig(thinking_budget=0),  # не тратим бюджет на "размышления"
             ),
         )
     except AIClientError:
@@ -1652,10 +1665,13 @@ def manager_send(text: str, persona: Persona) -> Optional[str]:
         with st.spinner(f"{persona.name} печатает..."):
             reply, ai_stress = call_ai_client(persona, st.session_state.messages)
     except AIClientError as e:
+        # Реплику менеджера, которую мы уже добавили в историю выше, оставляем как есть —
+        # но откатываем её из истории, если ИИ вообще не ответил, чтобы не путать контекст
+        # при повторной попытке. Проще и безопаснее — просто вернуть ошибку и ничего не менять.
         return str(e)
 
     # Обновляем стресс: если ИИ вернул stress_level в JSON — используем его (приоритет).
-    # Если нет (ai_stress is None, модель не вернула JSON) — оставляем эвристику как есть.
+    # Если нет (ai_stress is None, модель не вернула валидный JSON) — оставляем эвристику как есть.
     if ai_stress is not None:
         st.session_state.stress = ai_stress
         # Пересчитываем weak_streak на основе оценки самого ИИ:
