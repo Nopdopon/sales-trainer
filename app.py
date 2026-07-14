@@ -110,7 +110,7 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-GEMINI_MODEL = "gemini-1.5-flash"
+GEMINI_MODEL = "gemini-1.5-flash-002"
 OPENAI_MODEL = "gpt-4o-mini"
 
 
@@ -1657,7 +1657,6 @@ def run_ai_judge(persona: Persona) -> Dict:
                     temperature=0.3,
                     max_output_tokens=4000,
                     response_mime_type="application/json",
-                    thinking_config=genai_types.ThinkingConfig(thinking_budget=0),
                 ),
             )
         except Exception as e:
@@ -2398,9 +2397,30 @@ def screen_review():
                 st.session_state.review_result = run_ai_judge(persona)
             except AIClientError as e:
                 st.session_state.review_error = str(e)
+            except Exception as e:
+                # Ловим любые непредвиденные исключения — приложение не должно крашиться
+                st.session_state.review_error = f"Неожиданная ошибка: {type(e).__name__}: {e}"
 
     if st.session_state.review_error:
-        st.error(f"❌ Не удалось получить оценку: {st.session_state.review_error}")
+        err_text = st.session_state.review_error
+
+        # Детектируем 404 и даём понятную подсказку вместо сырого traceback
+        if "404" in err_text or "not found" in err_text.lower() or "NOT_FOUND" in err_text:
+            st.error(
+                f"❌ **Модель `{GEMINI_MODEL}` не найдена (ошибка 404)**\n\n"
+                f"Google обновил API. Проверьте константу `GEMINI_MODEL` в начале `app.py` "
+                f"и замените на актуальную модель (например `gemini-1.5-flash-002` или `gemini-2.0-flash`).\n\n"
+                f"Детали: `{err_text}`"
+            )
+        elif "quota" in err_text.lower() or "429" in err_text:
+            st.error(
+                f"❌ **Превышена квота Gemini API (429 Too Many Requests)**\n\n"
+                f"Подождите несколько минут и нажмите «Повторить попытку».\n\n"
+                f"Детали: `{err_text}`"
+            )
+        else:
+            st.error(f"❌ Не удалось получить оценку от ИИ-судьи:\n\n`{err_text}`")
+
         col_retry, col_back = st.columns(2)
         with col_retry:
             if st.button("🔁 Повторить попытку", use_container_width=True, type="primary"):
