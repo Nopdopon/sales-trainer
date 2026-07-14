@@ -110,7 +110,7 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-GEMINI_MODEL = "gemini-1.5-flash-002"
+GEMINI_MODEL = "gemini-2.0-flash"
 OPENAI_MODEL = "gpt-4o-mini"
 
 
