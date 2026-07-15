@@ -1448,7 +1448,7 @@ def call_ai_client(persona: Persona, history: List[Dict]) -> tuple[str, Optional
         for m in history:
             role = MessagesRole.USER if m["role"] == "manager" else MessagesRole.ASSISTANT
             msgs.append(Messages(role=role, content=m["text"]))
-        resp = giga.chat(Chat(messages=msgs, model=GIGACHAT_MODEL, max_tokens=400, temperature=0.85))
+        resp = giga.chat(Chat(messages=msgs, model=GIGACHAT_MODEL, max_tokens=1200, temperature=0.85))
         raw = (resp.choices[0].message.content or "").strip()
     except AIClientError:
         raise
