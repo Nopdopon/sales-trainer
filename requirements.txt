@@ -1,5 +1,5 @@
 streamlit>=1.32.0
-google-genai>=0.3.0
-openai>=1.30.0
+gigachat>=0.1.28
 streamlit-mic-recorder>=0.0.4
-edge-tts>=6.1.9
+requests>=2.31.0
+urllib3>=2.0.0
