@@ -966,65 +966,118 @@ with st.sidebar:
         st.rerun()
 
 # ============================================================
-#  ЭКРАН ТЕЛЕФОННОГО ЗВОНКА (полноэкранный overlay)
+#  ЭКРАН ТЕЛЕФОННОГО ЗВОНКА
 # ============================================================
 
 def screen_phone_call():
-    """Минималистичный экран звонка — скрывает весь остальной интерфейс."""
+    """Экран звонка: таймер, субтитры, ввод, кнопки управления."""
     persona = get_persona()
     if not persona:
         st.session_state.call_active = False
         st.rerun()
         return
 
-    # Первая реплика персонажа — если сообщений ещё нет
+    # ── Первая реплика персонажа ────────────────────────────
     if not st.session_state.messages:
         opening = random.choice(persona.opening_lines)
-        st.session_state.messages.append({"role":"client","text":opening,"ts":datetime.now().strftime("%H:%M")})
+        st.session_state.messages.append({
+            "role": "client", "text": opening, "ts": datetime.now().strftime("%H:%M")
+        })
         audio = tts_speak(opening, persona.name)
         if audio:
             st.audio(audio, format="audio/mp3", autoplay=True)
 
-    # Таймер
-    elapsed = int(time.time() - (st.session_state.call_start_time or time.time()))
+    # ── Таймер ──────────────────────────────────────────────
+    start = st.session_state.call_start_time or time.time()
+    elapsed = int(time.time() - start)
     mins, secs = divmod(elapsed, 60)
 
-    # Последние реплики для субтитров
-    last_client  = next((m["text"] for m in reversed(st.session_state.messages) if m["role"] == "client"), "")
-    last_manager = next((m["text"] for m in reversed(st.session_state.messages) if m["role"] == "manager"), "")
+    # ── Субтитры — последние реплики ────────────────────────
+    last_client  = next((m["text"] for m in reversed(st.session_state.messages)
+                         if m["role"] == "client"), "")
+    last_manager = next((m["text"] for m in reversed(st.session_state.messages)
+                         if m["role"] == "manager"), "")
 
-    avatar_html = (
-        f'<img src="{persona.avatar_url}" style="width:100px;height:100px;border-radius:50%;object-fit:cover;border:3px solid {persona.level_color}66;">'
-        if persona.avatar_url else f'<div class="phone-avatar">{persona.emoji}</div>'
-    )
+    def _clip(t: str, n: int = 110) -> str:
+        return t[:n] + "…" if len(t) > n else t
 
+    # ── Аватар ──────────────────────────────────────────────
+    if persona.avatar_url:
+        avatar_html = (
+            f'<img src="{persona.avatar_url}" '
+            f'style="width:96px;height:96px;border-radius:50%;object-fit:cover;'
+            f'border:3px solid {persona.level_color}88;display:block;margin:0 auto 10px auto;">'
+        )
+    else:
+        avatar_html = (
+            f'<div style="font-size:72px;text-align:center;margin-bottom:10px;">'
+            f'{persona.emoji}</div>'
+        )
+
+    # ── Субтитры HTML (только если есть текст) ──────────────
+    subtitle_client_html = (
+        f'<div style="background:rgba(20,20,60,0.85);border:1px solid #2a2a5a;'
+        f'border-radius:12px 12px 12px 4px;padding:9px 14px;'
+        f'font-size:13px;color:#c0c0e0;margin-bottom:6px;">'
+        f'{persona.emoji} {_clip(last_client)}</div>'
+    ) if last_client else ""
+
+    subtitle_manager_html = (
+        f'<div style="background:rgba(45,31,94,0.85);border:1px solid #4a3a80;'
+        f'border-radius:12px 12px 4px 12px;padding:9px 14px;'
+        f'font-size:13px;color:#e0d8ff;text-align:right;">'
+        f'👤 {_clip(last_manager)}</div>'
+    ) if last_manager else ""
+
+    # ── Основной HTML-блок — всё закрыто внутри одного st.markdown ──
     st.markdown(f"""
-    <div class="phone-screen">
-        <div style="text-align:center;">
-            {avatar_html}
-            <div class="phone-name">{persona.name}</div>
-            <div class="phone-status">📞 &nbsp; ИДЁт ЗВОНОК</div>
-            <div class="phone-timer">{mins:02d}:{secs:02d}</div>
-            <div class="pulse-dots">
-                <div class="pulse-dot" style="animation:pulse-dot 1.2s infinite 0s;"></div>
-                <div class="pulse-dot" style="animation:pulse-dot 1.2s infinite 0.4s;"></div>
-                <div class="pulse-dot" style="animation:pulse-dot 1.2s infinite 0.8s;"></div>
-            </div>
+    <div style="
+        background: radial-gradient(ellipse at top, #0a0a1e 0%, #000005 100%);
+        border-radius: 24px;
+        border: 1px solid #1a1a3a;
+        padding: 36px 24px 28px 24px;
+        text-align: center;
+        box-shadow: 0 0 60px rgba(45,205,115,0.08);
+        margin-bottom: 16px;
+    ">
+        {avatar_html}
+        <div style="font-size:26px;font-weight:800;color:#e8e8ff;margin-bottom:4px;">
+            {persona.name}
         </div>
-        <div class="phone-subtitles">
-            {f'<div class="phone-subtitle-client">{persona.emoji} {last_client[:120]}{"..." if len(last_client)>120 else ""}</div>' if last_client else ""}
-            {f'<div class="phone-subtitle-manager">👤 {last_manager[:120]}{"..." if len(last_manager)>120 else ""}</div>' if last_manager else ""}
+        <div style="font-size:12px;color:#606090;letter-spacing:2px;
+                    text-transform:uppercase;margin-bottom:8px;">
+            📞 &nbsp; ИДЁт ЗВОНОК
+        </div>
+        <div style="font-size:44px;font-weight:900;color:#2DCD73;
+                    font-family:'Courier New',monospace;
+                    text-shadow:0 0 16px rgba(45,205,115,0.6);margin-bottom:10px;">
+            {mins:02d}:{secs:02d}
+        </div>
+        <div style="display:flex;gap:8px;justify-content:center;margin-bottom:20px;">
+            <div style="width:10px;height:10px;border-radius:50%;background:#2DCD73;
+                        animation:pulse-dot 1.2s infinite 0s;"></div>
+            <div style="width:10px;height:10px;border-radius:50%;background:#2DCD73;
+                        animation:pulse-dot 1.2s infinite 0.4s;"></div>
+            <div style="width:10px;height:10px;border-radius:50%;background:#2DCD73;
+                        animation:pulse-dot 1.2s infinite 0.8s;"></div>
+        </div>
+        <div style="text-align:left;max-width:560px;margin:0 auto;">
+            {subtitle_client_html}
+            {subtitle_manager_html}
         </div>
     </div>
     """, unsafe_allow_html=True)
 
-    # Аудио TTS
+    # ── Аудио TTS ───────────────────────────────────────────
     if st.session_state.get("last_tts_audio"):
         st.audio(st.session_state.last_tts_audio, format="audio/mp3", autoplay=True)
         st.session_state.last_tts_audio = None
 
-    # Голосовой ввод
-    st.markdown("<div style='height:520px'></div>", unsafe_allow_html=True)  # отступ под overlay
+    # ── Стресс-бар ──────────────────────────────────────────
+    render_stress_bar(persona)
+    st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
+
+    # ── Голосовой / текстовый ввод ──────────────────────────
     if MIC_AVAILABLE:
         voice_text = speech_to_text(
             language="ru",
@@ -1036,35 +1089,63 @@ def screen_phone_call():
         if voice_text:
             err = manager_send(voice_text, persona)
             if err:
-                st.error(f"Ошибка: {err}")
-            if st.session_state.screen == "review":
+                st.error(f"Ошибка ИИ: {err}")
+            if st.session_state.get("screen") == "review":
                 st.session_state.call_active = False
             st.rerun()
     else:
         with st.form("call_text_form", clear_on_submit=True):
-            col_i, col_b = st.columns([5,1])
+            col_i, col_b = st.columns([5, 1])
             with col_i:
-                txt = st.text_input("Реплика", label_visibility="collapsed", placeholder="Напишите реплику...")
+                txt = st.text_input(
+                    "Реплика", label_visibility="collapsed",
+                    placeholder="Напишите вашу реплику..."
+                )
             with col_b:
                 sent = st.form_submit_button("➤", use_container_width=True, type="primary")
         if sent and txt:
             err = manager_send(txt, persona)
-            if err: st.error(f"Ошибка: {err}")
-            if st.session_state.screen == "review":
+            if err:
+                st.error(f"Ошибка ИИ: {err}")
+            if st.session_state.get("screen") == "review":
                 st.session_state.call_active = False
             st.rerun()
 
-    # Кнопка завершить
-    st.markdown("<div style='height:20px'></div>", unsafe_allow_html=True)
-    col1, col2, col3 = st.columns([1,1,1])
-    with col2:
-        if st.button("🔴  Положить трубку", use_container_width=True, type="primary",
-                     help="Завершить звонок"):
+    st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
+
+    # ── Кнопки управления ───────────────────────────────────
+    col_hang, col_menu = st.columns(2)
+
+    with col_hang:
+        if st.button("❌  Положить трубку", use_container_width=True, type="primary"):
             st.session_state.call_active = False
             st.session_state.call_ended_reason = "manager_ended"
             st.session_state.deal_closed = True
+            # Вызываем судью сразу здесь, чтобы review-экран не ждал спиннера
+            if st.session_state.messages and any(
+                m["role"] == "manager" for m in st.session_state.messages
+            ):
+                try:
+                    with st.spinner("ИИ-судья анализирует звонок..."):
+                        st.session_state.review_result = run_ai_judge(persona)
+                    save_to_csv(persona, st.session_state.review_result)
+                except Exception as e:
+                    st.session_state.review_error = str(e)
             st.session_state.screen = "review"
             st.rerun()
+
+    with col_menu:
+        if st.button("⬅️  В главное меню", use_container_width=True, type="secondary"):
+            st.session_state.call_active = False
+            reset_dialog_state()
+            st.session_state.screen = "menu"
+            st.rerun()
+
+    # ── Тикаем таймер каждую секунду ────────────────────────
+    # Делаем это только если звонок ещё активен и диалог не завершён
+    if st.session_state.get("call_active") and st.session_state.get("screen") != "review":
+        time.sleep(1)
+        st.rerun()
 
 # ============================================================
 #  ЭКРАН МЕНЮ
@@ -1379,14 +1460,14 @@ def screen_review():
     with col_s:
         st.markdown(f"""<div class="review-card" style="border-color:rgba(45,205,115,0.3);">
             <div style="font-size:13px;font-weight:700;color:#2DCD73;letter-spacing:1px;margin-bottom:10px;">✅ СИЛЬНЫЕ СТОРОНЫ</div>
-        """, unsafe_allow_html=True)
+        </div>""", unsafe_allow_html=True)
         for s in result.get("strengths", []):
             st.markdown(f"- {s}")
         st.markdown("</div>", unsafe_allow_html=True)
     with col_m:
         st.markdown(f"""<div class="review-card" style="border-color:rgba(255,75,75,0.25);">
             <div style="font-size:13px;font-weight:700;color:#FF4B4B;letter-spacing:1px;margin-bottom:10px;">❌ ОШИБКИ</div>
-        """, unsafe_allow_html=True)
+        </div>""", unsafe_allow_html=True)
         for mistake in result.get("mistakes", []):
             with st.expander(f"⚠️ {mistake.get('moment','Момент')}"):
                 st.markdown(f"**Проблема:** {mistake.get('issue','')}")
