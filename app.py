@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 KOSMOS AI — Sales Training Simulator
-Движок: GigaChat-Pro (Сбер) + SaluteSpeech TTS
+Движок: GigaChat-2-Pro (Сбер) + SaluteSpeech TTS
 Запуск: streamlit run app.py
 Секреты: SBER_AUTH_KEY в .streamlit/secrets.toml
 """
@@ -46,7 +46,7 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-GIGACHAT_MODEL  = "GigaChat-Pro"
+GIGACHAT_MODEL  = "GigaChat-2-Pro"
 HISTORY_CSV     = Path("sales_history.csv")
 HISTORY_COLS    = ["Дата/Время","Логин менеджера","Тема звонка","Тип звонка",
                    "Персонаж","Оценка (1-10)","Сильные стороны","Ошибки","Рекомендации тренеру"]
@@ -935,7 +935,7 @@ with st.sidebar:
         st.markdown(f"""
         <div style="background:rgba(45,205,115,0.1);border:1px solid rgba(45,205,115,0.3);
                     border-radius:10px;padding:10px 14px;">
-            <div style="color:#2DCD73;font-weight:700;font-size:13px;">✅ GigaChat-Pro подключён</div>
+            <div style="color:#2DCD73;font-weight:700;font-size:13px;">✅ GigaChat подключён</div>
             <div style="color:#505070;font-size:12px;margin-top:2px;">Сбер · {GIGACHAT_MODEL}</div>
         </div>""", unsafe_allow_html=True)
     else:
