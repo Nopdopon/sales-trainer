@@ -599,6 +599,14 @@ def _build_system_prompt(persona: Persona) -> str:
     return persona.system_prompt + _JSON_SUFFIX
 
 
+def _strip_html(text: str) -> str:
+    """Удаляет HTML-теги (<div>, </div> и любые другие) из текста GigaChat."""
+    text = re.sub(r'<[^>]+>', '', text)          # убираем любые теги
+    text = re.sub(r'&[a-zA-Z]+;', ' ', text)     # убираем HTML-сущности (&nbsp; и т.п.)
+    text = re.sub(r'\s{2,}', ' ', text)          # схлопываем множественные пробелы
+    return text.strip()
+
+
 def _parse_client_response(raw: str) -> Tuple[str, Optional[int]]:
     cleaned = raw.strip()
     if cleaned.startswith("```"):
@@ -613,16 +621,17 @@ def _parse_client_response(raw: str) -> Tuple[str, Optional[int]]:
             cleaned = cleaned[start:end + 1]
     try:
         data = json.loads(cleaned)
-        text = str(data.get("response", "")).strip()
+        text = _strip_html(str(data.get("response", "")).strip())
         raw_stress = data.get("stress_level")
         stress = int(raw_stress) if raw_stress is not None else None
         if stress is not None:
             stress = max(0, min(100, stress))
         if not text:
-            return raw, None
+            return _strip_html(raw), None
         return text, stress
     except (json.JSONDecodeError, ValueError, TypeError):
-        return raw, None
+        # Если JSON не распарсился — чистим и сырой текст
+        return _strip_html(raw), None
 
 
 def call_ai_client(persona: Persona, history: List[Dict]) -> Tuple[str, Optional[int]]:
