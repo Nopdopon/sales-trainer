@@ -101,7 +101,7 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-GIGACHAT_MODEL = "GigaChat-Pro"
+GIGACHAT_MODEL = "GigaChat-Max"
 
 
 def _get_sber_key() -> str:
