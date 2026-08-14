@@ -1,4 +1,4 @@
-streamlit==1.35.0
+streamlit==1.37.1
 starlette==0.37.2
 gigachat>=0.1.28
 streamlit-mic-recorder>=0.0.4
