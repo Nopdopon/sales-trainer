@@ -6,7 +6,7 @@ AI Sales Trainer — интерактивный тренажёр перегов�
     pip install -r requirements.txt
     streamlit run app.py
 
-Используется GigaChat-Pro (Сбер) для генерации реплик ИИ-клиента и финального разбора полётов.
+Используется GigaChat (Сбер) для генерации реплик ИИ-клиента и финального разбора полётов.
 Ключ авторизации берётся из .streamlit/secrets.toml (SBER_AUTH_KEY) или переменной окружения.
 
 Никогда не храните реальные ключи прямо в исходном коде — используйте переменные
@@ -101,7 +101,10 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-GIGACHAT_MODEL = "GigaChat-Max"
+# ФИКС БАГА №1: GigaChat-Pro удалена, а GigaChat-Max недоступна в большинстве тарифов
+# (ошибка 404 "No such model"). "GigaChat" — базовая модель, доступная во всех тарифах
+# без отдельного согласования, самая стабильная точка входа.
+GIGACHAT_MODEL = "GigaChat"
 
 
 def _get_sber_key() -> str:
@@ -647,6 +650,36 @@ PERSONAS = CLIENTS_DB
 
 
 # ============================================================
+#  АВАТАРЫ — ФИКС БАГА №3
+# ============================================================
+
+def _avatar_url(persona: "Persona") -> str:
+    """
+    Возвращает надёжный URL аватара.
+
+    ПРИЧИНА БАГА: часть ссылок на Unsplash не гарантированно доступна в облаке
+    Streamlit Cloud (хотлинк-ограничения / нестабильность стороннего CDN),
+    из-за чего вместо фото показывались пустые контуры.
+
+    РЕШЕНИЕ: если у персонажа задан кастомный avatar_url — используем его,
+    а если он не задан (или потребуется fallback) — генерируем аватар по
+    инициалам через ui-avatars.com — лёгкий, быстрый и надёжный сервис,
+    который не требует хранения файлов и не зависит от внешних фотостоков.
+
+    Для максимальной надёжности в проде рекомендуется в дальнейшем
+    переложить реальные фото в /assets/avatars внутри репозитория и
+    использовать относительные пути — тогда аватары будут грузиться
+    даже без доступа к внешним сервисам вообще.
+    """
+    if persona.avatar_url:
+        return persona.avatar_url
+    color = persona.level_color.lstrip("#")
+    parts = persona.name.split()
+    initials = "".join(w[0] for w in parts[:2]).upper() if parts else "?"
+    return f"https://ui-avatars.com/api/?name={initials}&background={color}&color=fff&size=150&bold=true"
+
+
+# ============================================================
 #  ИСТОРИЯ ДИАЛОГОВ — СОХРАНЕНИЕ В CSV (БЕЗ ИЗМЕНЕНИЙ)
 # ============================================================
 
@@ -869,7 +902,7 @@ require_auth()   # ← останавливает выполнение если 
 
 
 # ============================================================
-#  СТИЛИ — KOSMOS AI (БЕЗ ИЗМЕНЕНИЙ)
+#  СТИЛИ — KOSMOS AI
 # ============================================================
 st.markdown("""
 <style>
@@ -884,8 +917,10 @@ st.markdown("""
     [data-testid="stAppViewContainer"] > .main {
         background: radial-gradient(ellipse at 20% 20%, #0d0d2b 0%, #05050A 60%) !important;
     }
+    /* ФИКС БАГА №2: верхняя плашка "SPECIAL EDITION FOR INSOFT" и заголовок
+       обрезались верхней шторкой Streamlit. Увеличен padding-top контейнера. */
     .main .block-container {
-        padding-top: 1rem !important;
+        padding-top: 3.2rem !important;
         padding-bottom: 2rem !important;
     }
 
@@ -1353,7 +1388,7 @@ def render_stress_bar(persona: Persona):
 
 
 # ============================================================
-#  ВЫЗОВ AI-КЛИЕНТА — GigaChat-Pro
+#  ВЫЗОВ AI-КЛИЕНТА — GigaChat
 # ============================================================
 
 class AIClientError(Exception):
@@ -1438,7 +1473,7 @@ def _parse_client_response(raw: str) -> tuple[str, Optional[int]]:
 
 def call_ai_client(persona: Persona, history: List[Dict]) -> tuple[str, Optional[int]]:
     """
-    Возвращает (текст_реплики, stress_level) ИИ-клиента через GigaChat-Pro.
+    Возвращает (текст_реплики, stress_level) ИИ-клиента через GigaChat.
     stress_level = None если ИИ не вернул валидный JSON (будет использована эвристика).
     Бросает AIClientError при сбое.
     """
@@ -1462,7 +1497,7 @@ def call_ai_client(persona: Persona, history: List[Dict]) -> tuple[str, Optional
 
 
 # ============================================================
-#  AI-СУДЬЯ (РАЗБОР ПОЛЁТОВ) — GigaChat-Pro
+#  AI-СУДЬЯ (РАЗБОР ПОЛЁТОВ) — GigaChat
 # ============================================================
 
 def _build_transcript(persona: Persona) -> str:
@@ -1547,7 +1582,7 @@ def _parse_judge_json(raw: str) -> Dict:
 
 def run_ai_judge(persona: Persona) -> Dict:
     """
-    Вызывает GigaChat-Pro с системным промптом JUDGE_SYSTEM_PROMPT, передавая ей полный лог диалога,
+    Вызывает GigaChat с системным промптом JUDGE_SYSTEM_PROMPT, передавая ей полный лог диалога,
     и возвращает распарсенный JSON с оценкой.
     Бросает AIClientError при сбое — экран review должен это обработать и показать понятную ошибку.
     """
@@ -1610,14 +1645,14 @@ with st.sidebar:
 
     st.divider()
 
-    # --- Статус ИИ-движка (GigaChat-Pro, ключ из secrets) ---
+    # --- Статус ИИ-движка (GigaChat, ключ из secrets) ---
     st.markdown("### 🤖 ИИ-движок")
     _key_ok = bool(_get_sber_key()) and GIGACHAT_AVAILABLE
     if _key_ok:
         st.markdown(f"""
         <div style="background:rgba(45,205,115,0.1);border:1px solid rgba(45,205,115,0.3);
                     border-radius:10px;padding:10px 14px;">
-            <div style="color:#2DCD73;font-weight:700;font-size:13px;">✅ GigaChat-Pro подключён</div>
+            <div style="color:#2DCD73;font-weight:700;font-size:13px;">✅ GigaChat подключён</div>
             <div style="color:#505070;font-size:12px;margin-top:2px;">Сбер · {GIGACHAT_MODEL}</div>
         </div>
         """, unsafe_allow_html=True)
@@ -1661,7 +1696,7 @@ TOPIC_ICON = {"Недвижимость": "🏠", "IT-услуги и SaaS": "�
 
 def screen_menu():
     st.markdown("""
-    <div class="kosmos-logo" style="margin-bottom:4px;">
+    <div class="kosmos-logo" style="margin-bottom:4px;margin-top:14px;">
         <div class="kosmos-logo-title">🚀 KOSMOS AI</div>
         <div class="kosmos-logo-sub">Sales Training Simulator</div>
         <div style="margin-top:6px;display:inline-block;background:linear-gradient(135deg,#7F56D9,#60a5fa);
@@ -1751,19 +1786,13 @@ def screen_menu():
                 "Хардкор": "level-hardcore",
             }.get(persona.level, "level-expert")
 
-            # Аватар: фото или эмодзи
-            if persona.avatar_url:
-                avatar_html = (
-                    f'<img src="{persona.avatar_url}" '
-                    f'style="width:76px;height:76px;border-radius:50%;object-fit:cover;'
-                    f'display:block;margin:0 auto 10px auto;'
-                    f'border:2px solid {persona.level_color}44;">'
-                )
-            else:
-                avatar_html = (
-                    f'<div style="font-size:60px;text-align:center;'
-                    f'margin-bottom:10px;line-height:1;">{persona.emoji}</div>'
-                )
+            # Аватар: фото (или сгенерированный по инициалам fallback — см. _avatar_url)
+            avatar_html = (
+                f'<img src="{_avatar_url(persona)}" '
+                f'style="width:76px;height:76px;border-radius:50%;object-fit:cover;'
+                f'display:block;margin:0 auto 10px auto;'
+                f'border:2px solid {persona.level_color}44;">'
+            )
 
             ct_icon = CALL_TYPE_ICON.get(persona.call_type, "📞")
             st.markdown(f"""
@@ -2066,16 +2095,13 @@ def screen_call():
 
     if not st.session_state.call_active and st.session_state.call_start_time is None:
         # Экран входящего вызова
-        if persona.avatar_url:
-            avatar_html = (
-                f'<img src="{persona.avatar_url}" '
-                f'style="width:100px;height:100px;border-radius:50%;object-fit:cover;'
-                f'display:block;margin:0 auto 12px auto;'
-                f'border:3px solid {persona.level_color}66;'
-                f'box-shadow:0 0 24px {persona.level_color}44;">'
-            )
-        else:
-            avatar_html = f'<div class="call-avatar">{persona.emoji}</div>'
+        avatar_html = (
+            f'<img src="{_avatar_url(persona)}" '
+            f'style="width:100px;height:100px;border-radius:50%;object-fit:cover;'
+            f'display:block;margin:0 auto 12px auto;'
+            f'border:3px solid {persona.level_color}66;'
+            f'box-shadow:0 0 24px {persona.level_color}44;">'
+        )
 
         st.markdown(f"""
         <div class="call-screen">
@@ -2119,14 +2145,11 @@ def screen_call():
         status_dot = "🟢" if st.session_state.call_active else "🔴"
         status_label = "ИДЁт ЗВОНОК" if st.session_state.call_active else "ЗВОНОК ЗАВЕРШЁН"
 
-        if persona.avatar_url:
-            av_call = (
-                f'<img src="{persona.avatar_url}" '
-                f'style="width:72px;height:72px;border-radius:50%;object-fit:cover;'
-                f'display:block;margin:0 auto 8px auto;border:2px solid {persona.level_color}55;">'
-            )
-        else:
-            av_call = f'<div class="call-avatar" style="font-size:64px;">{persona.emoji}</div>'
+        av_call = (
+            f'<img src="{_avatar_url(persona)}" '
+            f'style="width:72px;height:72px;border-radius:50%;object-fit:cover;'
+            f'display:block;margin:0 auto 8px auto;border:2px solid {persona.level_color}55;">'
+        )
 
         st.markdown(f"""
         <div class="call-screen">
