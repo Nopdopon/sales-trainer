@@ -101,10 +101,13 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# ФИКС БАГА №1: GigaChat-Pro удалена, а GigaChat-Max недоступна в большинстве тарифов
-# (ошибка 404 "No such model"). "GigaChat" — базовая модель, доступная во всех тарифах
-# без отдельного согласования, самая стабильная точка входа.
-GIGACHAT_MODEL = "GigaChat"
+# ФИКС БАГА №1: имя модели должно ТОЧНО совпадать с одной из моделей,
+# подключённых в вашем тарифе (см. личный кабинет developers.sber.ru →
+# ваш проект → "Модели, доступные для покупки"). Просто "GigaChat" таким
+# именем не является и даёт 404 "No such model".
+# По вашему тарифу доступны: GigaChat-2-Max, GigaChat-2, GigaChat-2-Pro, GigaChat-2-Lite.
+# Берём Lite — она в тарифе, с самым большим бесплатным остатком токенов.
+GIGACHAT_MODEL = "GigaChat-2-Lite"
 
 
 def _get_sber_key() -> str:
