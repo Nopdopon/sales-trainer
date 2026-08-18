@@ -2137,9 +2137,14 @@ def screen_call():
                 st.rerun()
         return
 
-    @st.fragment(run_every=1.0)
+    # ФИКС: раньше здесь был @st.fragment(run_every=1.0) для "живого" тиканья таймера
+    # каждую секунду. Это вызывало RuntimeError: FragmentStorageKeyError /
+    # "Could not find fragment with id ..." при переподключении сессии
+    # (передеплой на Streamlit Cloud, потеря связи, повторное открытие вкладки) —
+    # браузер запрашивал у сервера фрагмент по ID, которого сервер уже не помнил.
+    # Убрали автотик — таймер теперь просто обычная функция и обновляется
+    # при каждом действии в звонке (отправка реплики и т.п.), без риска краша.
     def _render_call_timer():
-        """Тикает каждую секунду независимо от остального экрана — не мешает голосовому вводу."""
         if not st.session_state.call_start_time:
             return
         elapsed = int(time.time() - st.session_state.call_start_time)
