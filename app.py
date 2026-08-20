@@ -406,7 +406,7 @@ CLIENTS_DB: Dict[str, Persona] = {
         level="Опытный",
         level_color="#f59e0b",
         call_type="Холодный B2B",
-        topic="Insoft: Холодные продажи B2B",
+        topic="Холодные продажи B2B",
         tagline="Директор по закупкам, занят, отшивает холодные звонки за 20 секунд",
         description=(
             "Директор по закупкам крупного производственного холдинга. Получает 10+ холодных звонков "
@@ -442,7 +442,7 @@ CLIENTS_DB: Dict[str, Persona] = {
         level="Новичок",
         level_color="#22c55e",
         call_type="Холодный B2C",
-        topic="Insoft: Холодные продажи B2B",
+        topic="Холодные продажи B2B",
         tagline="Частный клиент, не ждала звонка, настороженная",
         description=(
             "Менеджер среднего звена, 34 года. Не ждала звонка, занята рабочими задачами. "
@@ -479,7 +479,7 @@ CLIENTS_DB: Dict[str, Persona] = {
         level="Хардкор",
         level_color="#ef4444",
         call_type="Холодный B2B",
-        topic="Insoft: Холодные продажи B2B",
+        topic="Холодные продажи B2B",
         tagline="Главный инженер. Душит техническими вопросами, проверяет матчасть",
         description=(
             "Главный инженер / IT-архитектор. Немедленно переходит к техническим вопросам: "
@@ -514,7 +514,7 @@ CLIENTS_DB: Dict[str, Persona] = {
         level="Опытный",
         level_color="#f59e0b",
         call_type="Холодный B2B",
-        topic="Insoft: Холодные продажи B2B",
+        topic="Холодные продажи B2B",
         tagline="Финансовый директор. Бюджет закрыт, денег нет, ничего не рассматривает",
         description=(
             "Финансовый директор. Её единственный критерий — деньги. "
@@ -550,7 +550,7 @@ CLIENTS_DB: Dict[str, Persona] = {
         level="Новичок",
         level_color="#22c55e",
         call_type="Холодный B2B",
-        topic="Insoft: Холодные продажи B2B",
+        topic="Холодные продажи B2B",
         tagline="Молодой руководитель отдела. Лень менять что-либо, «и так нормально»",
         description=(
             "Молодой руководитель отдела, 29 лет. Ему лень что-то менять — всё «и так работает». "
@@ -586,7 +586,7 @@ CLIENTS_DB: Dict[str, Persona] = {
         level="Опытный",
         level_color="#f59e0b",
         call_type="Холодный B2C",
-        topic="Insoft: Холодные продажи B2B",
+        topic="Холодные продажи B2B",
         tagline="Звонок застал в магазине с ребёнком. Орёт, что занят — перенеси звонок",
         description=(
             "Звонок застаёт его в магазине или на прогулке с ребёнком. "
@@ -621,7 +621,7 @@ CLIENTS_DB: Dict[str, Persona] = {
         level="Хардкор",
         level_color="#ef4444",
         call_type="Холодный B2C",
-        topic="Insoft: Холодные продажи B2B",
+        topic="Холодные продажи B2B",
         tagline="Напугана мошенниками. «Откуда мои данные?! Вы мошенники!»",
         description=(
             "Дважды пострадала от телефонных мошенников. На любое слово менеджера — паника и угроза вызвать полицию. "
@@ -685,7 +685,7 @@ def _avatar_url(persona: "Persona") -> str:
 #  ИСТОРИЯ ДИАЛОГОВ — СОХРАНЕНИЕ В CSV (БЕЗ ИЗМЕНЕНИЙ)
 # ============================================================
 
-HISTORY_CSV = Path("insoft_history.csv")
+HISTORY_CSV = Path("kosmos_history.csv")
 HISTORY_COLS = [
     "Дата/Время",
     "Логин менеджера",
@@ -701,7 +701,7 @@ HISTORY_COLS = [
 
 def save_to_csv(persona: "Persona", result: Dict) -> bool:
     """
-    Записывает результат разбора полётов в insoft_history.csv.
+    Записывает результат разбора полётов в kosmos_history.csv.
     Создаёт файл с заголовком если его нет. Возвращает True при успехе.
     """
     try:
@@ -1701,22 +1701,17 @@ def screen_menu():
     <div class="kosmos-logo" style="margin-bottom:4px;margin-top:14px;">
         <div class="kosmos-logo-title">🚀 KOSMOS AI</div>
         <div class="kosmos-logo-sub">Sales Training Simulator</div>
-        <div style="margin-top:6px;display:inline-block;background:linear-gradient(135deg,#7F56D9,#60a5fa);
-                    padding:3px 14px;border-radius:20px;font-size:11px;font-weight:700;
-                    letter-spacing:2px;color:#fff;">
-            ✦ SPECIAL EDITION FOR INSOFT ✦
-        </div>
     </div>
     """, unsafe_allow_html=True)
 
-    # ── Шаг 1: выбор темы (Insoft — первая и по умолчанию) ──
+    # ── Шаг 1: выбор темы (B2B/B2C — первая и по умолчанию) ──
     st.markdown("### Шаг 1 — Выберите тему")
 
-    INSOFT_TOPIC = "Insoft: Холодные продажи B2B"
+    INSOFT_TOPIC = "Холодные продажи B2B"
     other_topics = sorted({p.topic for p in CLIENTS_DB.values() if p.topic != INSOFT_TOPIC})
     all_topics_ordered = [INSOFT_TOPIC] + other_topics
 
-    # Активируем Insoft по умолчанию при первом открытии
+    # Активируем эту тему по умолчанию при первом открытии
     if not st.session_state.get("filter_topic"):
         st.session_state.filter_topic = INSOFT_TOPIC
 
@@ -1741,7 +1736,7 @@ def screen_menu():
     st.markdown(f"### Шаг 2 — Тип звонка ({chosen_topic})")
 
     if chosen_topic == INSOFT_TOPIC:
-        # Для Insoft — специальные кнопки B2B / B2C
+        # Специальные кнопки B2B / B2C
         insoft_types = ["Холодный B2B", "Холодный B2C"]
         ct_cols = st.columns(2)
         for col, ct in zip(ct_cols, insoft_types):
@@ -2466,7 +2461,7 @@ def screen_review():
         saved = save_to_csv(persona, result)
         st.session_state[save_key] = True
         if saved:
-            st.success("💾 Результат сохранён в `insoft_history.csv`")
+            st.success("💾 Результат сохранён в `kosmos_history.csv`")
 
     # Кнопка скачивания CSV если файл существует
     if HISTORY_CSV.exists():
@@ -2474,7 +2469,7 @@ def screen_review():
             st.download_button(
                 label="⬇️ Скачать историю диалогов (CSV)",
                 data=f.read(),
-                file_name="insoft_history.csv",
+                file_name="kosmos_history.csv",
                 mime="text/csv",
                 use_container_width=True,
             )
