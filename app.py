@@ -396,7 +396,7 @@ CLIENTS_DB: Dict[str, Persona] = {
         patience=3,
         hangup_line="Ясно. Скидку не даёте, ценность не обосновали. Пойдём к конкурентам. Спасибо за уделённое время.",
     ),
-    # ── ХОЛОДНЫЕ ПРОДАЖИ B2B / Холодный B2B ────────
+    # ── INSOFT: ХОЛОДНЫЕ ПРОДАЖИ B2B / Холодный B2B ────────
     "insoft_b2b": Persona(
         key="insoft_b2b",
         name="Дмитрий Олегович",
@@ -432,7 +432,7 @@ CLIENTS_DB: Dict[str, Persona] = {
         hangup_line="Понятно. Пришлите КП на почту, если есть что-то конкретное. Всего доброго. *кладёт трубку*",
     ),
 
-    # ── ХОЛОДНЫЕ ПРОДАЖИ B2C / Холодный B2C ────────
+    # ── INSOFT: ХОЛОДНЫЕ ПРОДАЖИ B2C / Холодный B2C ────────
     "insoft_b2c": Persona(
         key="insoft_b2c",
         name="Марина",
@@ -469,7 +469,7 @@ CLIENTS_DB: Dict[str, Persona] = {
         hangup_line="Ладно, спасибо за звонок, я подумаю... *завершает звонок*",
     ),
 
-    # ── B2B: Умник-технарь ────────────────────────────
+    # ── INSOFT B2B: Умник-технарь ────────────────────────────
     "insoft_techie": Persona(
         key="insoft_techie",
         name="Евгений Петрович",
@@ -504,7 +504,7 @@ CLIENTS_DB: Dict[str, Persona] = {
         hangup_line="Понятно. Матчасть не знаете. Когда разберётесь в продукте — перезвоните. *кладёт трубку*",
     ),
 
-    # ── B2B: Защитник бюджета ────────────────────────
+    # ── INSOFT B2B: Защитник бюджета ────────────────────────
     "insoft_cfo": Persona(
         key="insoft_cfo",
         name="Валерия",
@@ -540,7 +540,7 @@ CLIENTS_DB: Dict[str, Persona] = {
         hangup_line="Я уже сказала — бюджета нет. Не тратьте моё время, пожалуйста. *завершает звонок*",
     ),
 
-    # ── B2B: Пофигист ─────────────────────────────────
+    # ── INSOFT B2B: Пофигист ─────────────────────────────────
     "insoft_lazy": Persona(
         key="insoft_lazy",
         name="Алексей",
@@ -576,7 +576,7 @@ CLIENTS_DB: Dict[str, Persona] = {
         hangup_line="Слушай, ну не знаю... давай как-нибудь потом, не до этого сейчас. Пока. *кладёт трубку*",
     ),
 
-    # ── B2C: Занятой папа ─────────────────────────────
+    # ── INSOFT B2C: Занятой папа ─────────────────────────────
     "insoft_busy_dad": Persona(
         key="insoft_busy_dad",
         name="Игорь",
@@ -611,7 +611,7 @@ CLIENTS_DB: Dict[str, Persona] = {
         hangup_line="Всё, хватит! Я же сказал — ЗАНЯТ! Не звоните! *бросает трубку*",
     ),
 
-    # ── B2C: Жертва мошенников ───────────────────────
+    # ── INSOFT B2C: Жертва мошенников ───────────────────────
     "insoft_paranoid": Persona(
         key="insoft_paranoid",
         name="Елена",
@@ -1704,7 +1704,7 @@ def screen_menu():
         <div style="margin-top:6px;display:inline-block;background:linear-gradient(135deg,#7F56D9,#60a5fa);
                     padding:3px 14px;border-radius:20px;font-size:11px;font-weight:700;
                     letter-spacing:2px;color:#fff;">
-        
+            ✦ SPECIAL EDITION FOR INSOFT ✦
         </div>
     </div>
     """, unsafe_allow_html=True)
