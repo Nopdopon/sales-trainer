@@ -75,6 +75,14 @@ def _get_yandex_credentials() -> tuple[str, str]:
     return api_key, folder_id
 
 
+def _set_tts_error(msg: Optional[str]) -> None:
+    """Запоминает причину сбоя озвучки (или очищает её), чтобы показать в интерфейсе."""
+    try:
+        st.session_state["tts_error"] = msg
+    except Exception:
+        pass
+
+
 def text_to_speech(text: str, voice_name: str = "filipp") -> Optional[bytes]:
     """
     Отправляет текст в Yandex SpeechKit (Yandex AI Studio) и возвращает байты MP3.
@@ -84,11 +92,13 @@ def text_to_speech(text: str, voice_name: str = "filipp") -> Optional[bytes]:
         voice_name — техническое имя голоса Yandex (например "filipp", "alena" и т.д.),
                      закреплённое за конкретным персонажем.
 
-    Возвращает None, если ключи не настроены, текст пуст, или запрос завершился ошибкой —
-    приложение в этом случае просто не проигрывает звук, не падая.
+    При сбое возвращает None (приложение не падает), а причина записывается в
+    st.session_state["tts_error"] и показывается пользователю под чатом.
     """
     api_key, folder_id = _get_yandex_credentials()
     if not api_key or not folder_id:
+        missing = [n for n, v in (("YANDEX_API_KEY", api_key), ("YANDEX_FOLDER_ID", folder_id)) if not v]
+        _set_tts_error("в Secrets не задано: " + ", ".join(missing))
         return None
 
     # Убираем ремарки вида *бросает трубку*, *кладёт трубку* — они не нужны в аудио
@@ -99,20 +109,50 @@ def text_to_speech(text: str, voice_name: str = "filipp") -> Optional[bytes]:
     headers = {
         "Authorization": f"Api-Key {api_key}",
     }
-    data = {
+    base = {
         "text": clean,
         "lang": "ru-RU",
         "voice": voice_name,
         "format": "mp3",
-        "folderId": folder_id,
     }
 
-    try:
-        response = requests.post(YANDEX_TTS_URL, headers=headers, data=data, timeout=20)
-        response.raise_for_status()
-        return response.content
-    except Exception:
-        return None
+    # 1-я попытка — как в задании (с folderId). Если Яндекс не принял запрос, пробуем без
+    # folderId: для API-ключа сервисного аккаунта он не обязателен и иногда вызывает отказ.
+    attempts = [dict(base, folderId=folder_id), dict(base)]
+    last_error = "неизвестная ошибка"
+    for payload in attempts:
+        try:
+            response = requests.post(YANDEX_TTS_URL, headers=headers, data=payload, timeout=20)
+        except Exception as ex:
+            last_error = f"нет связи с Яндексом ({type(ex).__name__})"
+            continue
+        if response.status_code == 200 and response.content:
+            _set_tts_error(None)
+            return response.content
+        body = (response.text or "").strip().replace("\n", " ")[:300]
+        last_error = f"Яндекс ответил {response.status_code}: {body}"
+
+    _set_tts_error(last_error)
+    return None
+
+
+def play_pending_tts_audio() -> None:
+    """
+    Проигрывает последнюю озвученную реплику персонажа (если есть) и удаляет временный файл.
+    Плеер на странице скрыт CSS — звук включается автоматически, без виджета.
+    Если озвучка не получилась — под чатом показывается причина.
+    """
+    path = st.session_state.get("last_tts_audio")
+    if path:
+        st.audio(path, format="audio/mp3", autoplay=True)
+        st.session_state.last_tts_audio = None   # сбрасываем, чтобы не проигрывать повторно при rerun
+        try:
+            os.remove(path)   # временный файл больше не нужен
+        except Exception:
+            pass
+    err = st.session_state.get("tts_error")
+    if err:
+        st.caption(f"🔇 Озвучка недоступна: {err}")
 
 
 def _save_audio_to_tempfile(audio_bytes: bytes) -> Optional[str]:
@@ -1385,6 +1425,17 @@ st.markdown("""
         z-index: 0;
     }
 
+    /* Скрытый плеер озвучки: звук играет автоматически, сам виджет не показываем */
+    [data-testid="stElementContainer"]:has(audio.stAudio),
+    .element-container:has(audio.stAudio) {
+        display: none !important;
+    }
+    audio.stAudio, [data-testid="stAudio"] {
+        position: absolute !important;
+        width: 1px !important; height: 1px !important;
+        opacity: 0 !important; pointer-events: none !important;
+    }
+
     /* Экспандеры */
     .streamlit-expanderHeader {
         background: #0e0e22 !important;
@@ -2074,14 +2125,7 @@ def screen_chat():
     st.divider()
 
     # Автовоспроизведение последней реплики ИИ-клиента
-    if st.session_state.get("last_tts_audio"):
-        _tts_path = st.session_state.last_tts_audio
-        st.audio(_tts_path, format="audio/mp3", autoplay=True)
-        st.session_state.last_tts_audio = None   # сбрасываем, чтобы не проигрывать повторно при rerun
-        try:
-            os.remove(_tts_path)   # временный файл больше не нужен
-        except Exception:
-            pass
+    play_pending_tts_audio()
 
     if st.session_state.auto_ended:
         st.error(f"💬 {persona.name} прервал чат — переходим к разбору полётов.")
@@ -2228,6 +2272,9 @@ def screen_call():
                 st.session_state.messages.append({
                     "role": "client", "text": opening, "ts": datetime.now().strftime("%H:%M"),
                 })
+                # Первая фраза клиента тоже озвучивается его голосом
+                _open_audio = text_to_speech(opening, voice_name=persona.voice)
+                st.session_state.last_tts_audio = _save_audio_to_tempfile(_open_audio) if _open_audio else None
                 st.rerun()
         return
 
@@ -2269,14 +2316,7 @@ def screen_call():
     render_call_log(persona)
 
     # Автовоспроизведение последней реплики ИИ-клиента
-    if st.session_state.get("last_tts_audio"):
-        _tts_path = st.session_state.last_tts_audio
-        st.audio(_tts_path, format="audio/mp3", autoplay=True)
-        st.session_state.last_tts_audio = None
-        try:
-            os.remove(_tts_path)   # временный файл больше не нужен
-        except Exception:
-            pass
+    play_pending_tts_audio()
 
     if st.session_state.call_ended_reason == "auto_hangup":
         st.error(f"📵 {persona.name} прервал разговор автоматически — слишком высокий стресс или много слабых ответов подряд.")
