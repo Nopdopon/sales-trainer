@@ -15,6 +15,7 @@ AI Sales Trainer — интерактивный тренажёр перегов�
 
 import json
 import os
+import hmac
 import csv
 import random
 import time
@@ -41,52 +42,87 @@ try:
 except ImportError:
     MIC_AVAILABLE = False
 
-import asyncio
 import io
+import re
+import tempfile
 
-try:
-    import edge_tts
-    TTS_AVAILABLE = True
-except ImportError:
-    TTS_AVAILABLE = False
+import requests
+
+TTS_AVAILABLE = True  # requests — часть стандартного стека, всегда доступна
 
 
 # ============================================================
-#  TTS — ОЗВУЧКА РЕПЛИК ИИ-КЛИЕНТА (edge-tts, бесплатно) — БЕЗ ИЗМЕНЕНИЙ
+#  TTS — ОЗВУЧКА РЕПЛИК ИИ-КЛИЕНТА (Yandex AI Studio / SpeechKit)
 # ============================================================
+#  Миграция с edge-tts на Yandex SpeechKit REST API.
+#  Авторизация — по API-ключу Yandex AI Studio, ключ и ID каталога
+#  берутся из st.secrets (YANDEX_API_KEY, YANDEX_FOLDER_ID).
 
-TTS_VOICE_MALE   = "ru-RU-DmitryNeural"
-TTS_VOICE_FEMALE = "ru-RU-SvetlanaNeural"
-TTS_RATE         = "+15%"
-
-
-async def _tts_generate(text: str, voice: str) -> bytes:
-    """Асинхронно генерирует MP3-аудио через edge-tts и возвращает байты."""
-    communicate = edge_tts.Communicate(text=text, voice=voice, rate=TTS_RATE)
-    buf = io.BytesIO()
-    async for chunk in communicate.stream():
-        if chunk["type"] == "audio":
-            buf.write(chunk["data"])
-    buf.seek(0)
-    return buf.read()
+YANDEX_TTS_URL = "https://tts.api.cloud.yandex.net/speech/v1/tts:synthesize"
 
 
-def tts_speak(text: str, gender: str) -> Optional[bytes]:
+def _get_yandex_credentials() -> tuple[str, str]:
+    """Читает YANDEX_API_KEY и YANDEX_FOLDER_ID из secrets.toml / переменных окружения."""
+    api_key = os.environ.get("YANDEX_API_KEY", "")
+    folder_id = os.environ.get("YANDEX_FOLDER_ID", "")
+    try:
+        if not api_key:
+            api_key = st.secrets.get("YANDEX_API_KEY", "")
+        if not folder_id:
+            folder_id = st.secrets.get("YANDEX_FOLDER_ID", "")
+    except Exception:
+        pass
+    return api_key, folder_id
+
+
+def text_to_speech(text: str, voice_name: str = "filipp") -> Optional[bytes]:
     """
-    Синхронная обёртка: запускает асинхронную генерацию TTS через asyncio.run().
-    Возвращает байты MP3 или None при ошибке / если пакет не установлен.
-    Очищает текст от служебных маркеров (*действие*, stage directions и т.п.) перед озвучкой.
+    Отправляет текст в Yandex SpeechKit (Yandex AI Studio) и возвращает байты MP3.
+
+    Параметры:
+        text       — реплика персонажа, которую нужно озвучить.
+        voice_name — техническое имя голоса Yandex (например "filipp", "alena" и т.д.),
+                     закреплённое за конкретным персонажем.
+
+    Возвращает None, если ключи не настроены, текст пуст, или запрос завершился ошибкой —
+    приложение в этом случае просто не проигрывает звук, не падая.
     """
-    if not TTS_AVAILABLE:
+    api_key, folder_id = _get_yandex_credentials()
+    if not api_key or not folder_id:
         return None
-    import re
+
     # Убираем ремарки вида *бросает трубку*, *кладёт трубку* — они не нужны в аудио
     clean = re.sub(r'\*[^*]+\*', '', text).strip()
     if not clean:
         return None
-    voice = TTS_VOICE_FEMALE if gender == "female" else TTS_VOICE_MALE
+
+    headers = {
+        "Authorization": f"Api-Key {api_key}",
+    }
+    data = {
+        "text": clean,
+        "lang": "ru-RU",
+        "voice": voice_name,
+        "format": "mp3",
+        "folderId": folder_id,
+    }
+
     try:
-        return asyncio.run(_tts_generate(clean, voice))
+        response = requests.post(YANDEX_TTS_URL, headers=headers, data=data, timeout=20)
+        response.raise_for_status()
+        return response.content
+    except Exception:
+        return None
+
+
+def _save_audio_to_tempfile(audio_bytes: bytes) -> Optional[str]:
+    """Сохраняет байты MP3 во временный файл и возвращает путь к нему (для st.audio)."""
+    try:
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
+        tmp.write(audio_bytes)
+        tmp.flush()
+        tmp.close()
+        return tmp.name
     except Exception:
         return None
 
@@ -134,6 +170,7 @@ class Persona:
     emoji: str
     avatar_url: str          # URL фото или "" для эмодзи-аватара
     gender: str              # "male" | "female" — для выбора TTS-голоса
+    voice: str               # техническое имя голоса Yandex SpeechKit (filipp, alena, ...)
     level: str               # "Новичок" | "Опытный" | "Хардкор"
     level_color: str
     call_type: str           # "Тёплый" | "Холодный"
@@ -156,6 +193,7 @@ CLIENTS_DB: Dict[str, Persona] = {
         emoji="🙂",
         avatar_url="",
         gender="male",
+        voice="madirus",
         level="Новичок",
         level_color="#22c55e",
         call_type="Тёплый",
@@ -191,6 +229,7 @@ CLIENTS_DB: Dict[str, Persona] = {
         emoji="😟",
         avatar_url="https://images.unsplash.com/photo-1500648767791-00dcc994a43e?w=150",
         gender="male",
+        voice="madirus",
         level="Новичок",
         level_color="#22c55e",
         call_type="Тёплый",
@@ -227,6 +266,7 @@ CLIENTS_DB: Dict[str, Persona] = {
         emoji="🧐",
         avatar_url="",
         gender="female",
+        voice="julia",
         level="Опытный",
         level_color="#f59e0b",
         call_type="Холодный",
@@ -262,6 +302,7 @@ CLIENTS_DB: Dict[str, Persona] = {
         emoji="😤",
         avatar_url="https://images.unsplash.com/photo-1492562080023-ab3db95bfbce?w=150",
         gender="male",
+        voice="zahar",
         level="Опытный",
         level_color="#f59e0b",
         call_type="Холодный",
@@ -297,6 +338,7 @@ CLIENTS_DB: Dict[str, Persona] = {
         emoji="😠",
         avatar_url="",
         gender="male",
+        voice="zahar",
         level="Хардкор",
         level_color="#ef4444",
         call_type="Холодный",
@@ -332,6 +374,7 @@ CLIENTS_DB: Dict[str, Persona] = {
         emoji="💼",
         avatar_url="https://images.unsplash.com/photo-1573496359142-b8d87734a5a2?w=150",
         gender="female",
+        voice="dasha",
         level="Опытный",
         level_color="#f59e0b",
         call_type="Холодный",
@@ -367,6 +410,7 @@ CLIENTS_DB: Dict[str, Persona] = {
         emoji="🤨",
         avatar_url="https://images.unsplash.com/photo-1519085360753-af0119f7cbe7?w=150",
         gender="male",
+        voice="filipp",
         level="Хардкор",
         level_color="#ef4444",
         call_type="Тёплый",
@@ -403,6 +447,7 @@ CLIENTS_DB: Dict[str, Persona] = {
         emoji="🏢",
         avatar_url="https://images.unsplash.com/photo-1560250097-0b93528c311a?w=150",
         gender="male",
+        voice="filipp",
         level="Опытный",
         level_color="#f59e0b",
         call_type="Холодный B2B",
@@ -439,6 +484,7 @@ CLIENTS_DB: Dict[str, Persona] = {
         emoji="👩",
         avatar_url="https://images.unsplash.com/photo-1544005313-94ddf0286df2?w=150",
         gender="female",
+        voice="alena",
         level="Новичок",
         level_color="#22c55e",
         call_type="Холодный B2C",
@@ -476,6 +522,7 @@ CLIENTS_DB: Dict[str, Persona] = {
         emoji="🔧",
         avatar_url="https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?w=150",
         gender="male",
+        voice="madirus",
         level="Хардкор",
         level_color="#ef4444",
         call_type="Холодный B2B",
@@ -511,6 +558,7 @@ CLIENTS_DB: Dict[str, Persona] = {
         emoji="💰",
         avatar_url="https://images.unsplash.com/photo-1580489944761-15a19d654956?w=150",
         gender="female",
+        voice="julia",
         level="Опытный",
         level_color="#f59e0b",
         call_type="Холодный B2B",
@@ -547,6 +595,7 @@ CLIENTS_DB: Dict[str, Persona] = {
         emoji="😴",
         avatar_url="https://images.unsplash.com/photo-1472099645785-5658abf4ff4e?w=150",
         gender="male",
+        voice="madirus",
         level="Новичок",
         level_color="#22c55e",
         call_type="Холодный B2B",
@@ -583,6 +632,7 @@ CLIENTS_DB: Dict[str, Persona] = {
         emoji="👨‍👧",
         avatar_url="https://images.unsplash.com/photo-1504257432389-52343af06ae3?w=150",
         gender="male",
+        voice="zahar",
         level="Опытный",
         level_color="#f59e0b",
         call_type="Холодный B2C",
@@ -618,6 +668,7 @@ CLIENTS_DB: Dict[str, Persona] = {
         emoji="😱",
         avatar_url="https://images.unsplash.com/photo-1438761681033-6461ffad8d80?w=150",
         gender="female",
+        voice="dasha",
         level="Хардкор",
         level_color="#ef4444",
         call_type="Холодный B2C",
@@ -793,7 +844,8 @@ def _check_credentials(login: str, password: str) -> str:
         return "wrong"
 
     user = users[login]
-    if str(user.get("password", "")) != password:
+    expected = str(user.get("password", ""))
+    if not expected or not hmac.compare_digest(expected.encode("utf-8"), password.encode("utf-8")):
         return "wrong"
 
     expires_str = str(user.get("expires", ""))
@@ -843,9 +895,10 @@ def screen_login():
                 elif result == "expired":
                     st.error("⏰ Срок вашего доступа истёк. Обратитесь к администратору для продления.")
                 elif result == "no_users":
-                    st.session_state.authenticated = True
-                    st.session_state.current_user = "dev"
-                    st.rerun()
+                    # БЕЗОПАСНОСТЬ: раньше здесь был вход "dev" без проверки — пускал любого,
+                    # если в Secrets не заданы пользователи. Теперь вход закрыт.
+                    st.error("🔒 Доступ не настроен: в Secrets не заданы пользователи. "
+                             "Обратитесь к администратору.")
                 else:
                     st.error("❌ Неверный логин или пароль.")
 
@@ -1637,8 +1690,8 @@ with st.sidebar:
                 st.caption(f"👤 {user} · доступ до {expires_str}")
         except Exception:
             st.caption(f"👤 {user}")
-    elif user == "dev":
-        st.caption("👤 dev-режим (без авторизации)")
+    elif user:
+        st.caption(f"👤 {user}")
 
     if st.button("🚪 Выйти", use_container_width=True):
         st.session_state.authenticated = False
@@ -1907,9 +1960,10 @@ def manager_send(text: str, persona: Persona) -> Optional[str]:
     })
     st.session_state.turn_count += 1
 
-    # Озвучка ответа ИИ-клиента (edge-tts, без изменений)
-    audio_bytes = tts_speak(reply, persona.gender)
-    st.session_state.last_tts_audio = audio_bytes
+    # Озвучка ответа ИИ-клиента (Yandex SpeechKit)
+    # Озвучка именно тем голосом Yandex, который закреплён за этим персонажем
+    audio_bytes = text_to_speech(reply, voice_name=persona.voice)
+    st.session_state.last_tts_audio = _save_audio_to_tempfile(audio_bytes) if audio_bytes else None
 
     # Повторная проверка авто-завершения после обновления стресса
     if check_auto_end(persona):
@@ -1981,8 +2035,13 @@ def screen_chat():
 
     # Автовоспроизведение последней реплики ИИ-клиента
     if st.session_state.get("last_tts_audio"):
-        st.audio(st.session_state.last_tts_audio, format="audio/mp3", autoplay=True)
+        _tts_path = st.session_state.last_tts_audio
+        st.audio(_tts_path, format="audio/mp3", autoplay=True)
         st.session_state.last_tts_audio = None   # сбрасываем, чтобы не проигрывать повторно при rerun
+        try:
+            os.remove(_tts_path)   # временный файл больше не нужен
+        except Exception:
+            pass
 
     if st.session_state.auto_ended:
         st.error(f"💬 {persona.name} прервал чат — переходим к разбору полётов.")
@@ -2171,8 +2230,13 @@ def screen_call():
 
     # Автовоспроизведение последней реплики ИИ-клиента
     if st.session_state.get("last_tts_audio"):
-        st.audio(st.session_state.last_tts_audio, format="audio/mp3", autoplay=True)
+        _tts_path = st.session_state.last_tts_audio
+        st.audio(_tts_path, format="audio/mp3", autoplay=True)
         st.session_state.last_tts_audio = None
+        try:
+            os.remove(_tts_path)   # временный файл больше не нужен
+        except Exception:
+            pass
 
     if st.session_state.call_ended_reason == "auto_hangup":
         st.error(f"📵 {persona.name} прервал разговор автоматически — слишком высокий стресс или много слабых ответов подряд.")
