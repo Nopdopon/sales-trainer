@@ -823,11 +823,32 @@ JUDGE_SYSTEM_PROMPT = """Ты — опытный директор отдела �
 # ============================================================
 
 def _get_users() -> Dict:
-    """Читает список пользователей из secrets.toml. Возвращает пустой dict если не настроено."""
+    """
+    Читает пользователей из secrets.toml (секция [users.<логин>]).
+    Логины нормализуются (обрезаются пробелы, нижний регистр), чтобы регистр и случайные
+    пробелы в Secrets не ломали вход. Возвращает пустой dict если не настроено.
+    """
     try:
-        return dict(st.secrets.get("users", {}))
+        raw = st.secrets.get("users", {})
+        users: Dict = {}
+        for k, v in dict(raw).items():
+            key = str(k).strip().lower()
+            if hasattr(v, "get"):
+                users[key] = v
+            else:
+                # Допускаем упрощённую запись: admin = "пароль"
+                users[key] = {"password": str(v)}
+        return users
     except Exception:
         return {}
+
+
+def _auth_debug_enabled() -> bool:
+    """Диагностика входа включается флагом DEBUG_AUTH = true в Secrets (по умолчанию выключена)."""
+    try:
+        return bool(st.secrets.get("DEBUG_AUTH", False))
+    except Exception:
+        return False
 
 
 def _check_credentials(login: str, password: str) -> str:
@@ -844,8 +865,9 @@ def _check_credentials(login: str, password: str) -> str:
         return "wrong"
 
     user = users[login]
-    expected = str(user.get("password", ""))
-    if not expected or not hmac.compare_digest(expected.encode("utf-8"), password.encode("utf-8")):
+    expected = str(user.get("password", "")).strip()
+    entered = password.strip()
+    if not expected or not hmac.compare_digest(expected.encode("utf-8"), entered.encode("utf-8")):
         return "wrong"
 
     expires_str = str(user.get("expires", ""))
@@ -858,6 +880,22 @@ def _check_credentials(login: str, password: str) -> str:
             pass  # если дата задана некорректно — пропускаем проверку
 
     return "ok"
+
+
+def _auth_debug_report(login: str, password: str) -> str:
+    """Подсказка для администратора: что именно не совпало (сами пароли не показываются)."""
+    users = _get_users()
+    norm_login = login.strip().lower()
+    lines = [f"Пользователей в Secrets: {len(users)}"]
+    lines.append("Логины в Secrets: " + (", ".join(f"`{k}`" for k in users) or "—"))
+    lines.append(f"Введённый логин (после обработки): `{norm_login}`")
+    if norm_login not in users:
+        lines.append("➡️ Такого логина в Secrets нет. Проверьте имя секции [users.\"...\"].")
+    else:
+        expected = str(users[norm_login].get("password", "")).strip()
+        lines.append("➡️ Логин найден, не совпал пароль. "
+                     f"Длина пароля в Secrets: {len(expected)}, введено: {len(password.strip())}.")
+    return "\n\n".join(lines)
 
 
 def screen_login():
@@ -901,6 +939,8 @@ def screen_login():
                              "Обратитесь к администратору.")
                 else:
                     st.error("❌ Неверный логин или пароль.")
+                    if _auth_debug_enabled():
+                        st.info(_auth_debug_report(login, password))
 
         st.markdown("""
         <div style="text-align:center;margin-top:20px;color:#404060;font-size:12px;letter-spacing:0.5px;">
