@@ -99,6 +99,62 @@ VOICE_FALLBACKS = {
 }
 
 
+def _clean_for_tts(text: str) -> str:
+    """
+    Готовит реплику к синтезу: убирает ремарки (*кладёт трубку*), эмодзи и символы разметки,
+    на которых синтез речи может сбоиться, и схлопывает лишние пробелы.
+    Возвращает пустую строку, если озвучивать нечего (например, остались одни знаки препинания).
+    """
+    t = re.sub(r'\*\*([^*]+)\*\*', r'\1', text)                   # **жирный** -> обычный текст (слова остаются)
+    t = re.sub(r'\*[^*]+\*', '', t)                              # ремарки вида *бросает трубку*
+    t = re.sub(r'[\U00010000-\U0010FFFF\u200d\ufe0f\u2600-\u27BF]', '', t)   # эмодзи и пиктограммы
+    t = re.sub(r'[*_`#~|<>\[\]{}\\]', ' ', t)                    # символы разметки
+    t = re.sub(r'\s+', ' ', t).strip()
+    return t if re.search(r'\w', t) else ""
+
+
+def _synthesize_with_voice(voice: str, clean: str, headers: Dict[str, str], folder_id: str) -> tuple[Optional[bytes], str, bool]:
+    """
+    Одна попытка озвучки конкретным голосом (до 3 запросов).
+    Возвращает (аудио | None, описание_ошибки, фатальная_ошибка_доступа).
+      • 5xx от Яндекса — это сбой на его стороне: повторяем с короткой паузой;
+      • прочие 4xx — один раз пробуем без folderId (для API-ключа он не обязателен);
+      • 401/403 — проблема ключа/прав, повторять бессмысленно.
+    """
+    use_folder = True
+    last = "неизвестная ошибка"
+    for attempt in range(3):
+        payload = {"text": clean, "lang": "ru-RU", "voice": voice, "format": "mp3"}
+        if use_folder:
+            payload["folderId"] = folder_id
+        try:
+            resp = _yandex_http().post(YANDEX_TTS_URL, headers=headers, data=payload, timeout=(5, 20))
+        except Exception as ex:
+            last = f"нет связи с Яндексом ({type(ex).__name__})"
+            continue
+
+        if resp.status_code == 200 and resp.content:
+            return resp.content, "", False
+
+        code = resp.status_code
+        body = (resp.text or "").strip().replace("\n", " ")[:300]
+        last = f"Яндекс ответил {code}: {body}"
+
+        if code in (401, 403):
+            return None, last, True
+        if "unsupported voice" in body.lower():
+            break                       # этот голос не поддерживается — сразу к резервному
+        if code >= 500:
+            if attempt < 2:
+                time.sleep(0.4 * (attempt + 1))   # сбой на стороне Яндекса — короткая пауза и повтор
+            continue
+        if use_folder:
+            use_folder = False          # другая 4xx — пробуем без folderId
+            continue
+        break
+    return None, last, False
+
+
 def text_to_speech(text: str, voice_name: str = "filipp") -> Optional[bytes]:
     """
     Отправляет текст в Yandex SpeechKit (Yandex AI Studio) и возвращает байты MP3.
@@ -108,9 +164,9 @@ def text_to_speech(text: str, voice_name: str = "filipp") -> Optional[bytes]:
         voice_name — техническое имя голоса Yandex (например "filipp", "alena" и т.д.),
                      закреплённое за конкретным персонажем.
 
-    Если Яндекс не принимает голос — автоматически пробуется резервный голос того же пола
-    (см. VOICE_FALLBACKS). При полном сбое возвращает None (приложение не падает), а причина
-    записывается в st.session_state["tts_error"] и показывается под чатом.
+    Если голос не принимается или Яндекс отвечает ошибкой — пробуется резервный голос того же
+    пола (см. VOICE_FALLBACKS). При полном сбое возвращает None (приложение не падает), а причина
+    с названием голоса записывается в st.session_state["tts_error"] и показывается под чатом.
     """
     api_key, folder_id = _get_yandex_credentials()
     if not api_key or not folder_id:
@@ -118,8 +174,7 @@ def text_to_speech(text: str, voice_name: str = "filipp") -> Optional[bytes]:
         _set_tts_error("в Secrets не задано: " + ", ".join(missing))
         return None
 
-    # Убираем ремарки вида *бросает трубку*, *кладёт трубку* — они не нужны в аудио
-    clean = re.sub(r'\*[^*]+\*', '', text).strip()
+    clean = _clean_for_tts(text)
     if not clean:
         return None
 
@@ -130,37 +185,26 @@ def text_to_speech(text: str, voice_name: str = "filipp") -> Optional[bytes]:
     if fallback and fallback != voice_name:
         voices_to_try.append(fallback)
 
-    last_error = "неизвестная ошибка"
+    errors = []
     for voice in voices_to_try:
-        # 1-я попытка — как в задании (с folderId). Если не приняли, пробуем без него:
-        # для API-ключа сервисного аккаунта он не обязателен.
-        for use_folder in (True, False):
-            payload = {"text": clean, "lang": "ru-RU", "voice": voice, "format": "mp3"}
-            if use_folder:
-                payload["folderId"] = folder_id
+        audio, err, fatal = _synthesize_with_voice(voice, clean, headers, folder_id)
+        if audio:
+            _set_tts_error(None)
             try:
-                response = _yandex_http().post(YANDEX_TTS_URL, headers=headers, data=payload, timeout=(5, 20))
-            except Exception as ex:
-                last_error = f"нет связи с Яндексом ({type(ex).__name__})"
-                continue
+                st.session_state["tts_notice"] = (
+                    None if voice == voice_name
+                    else f"голос «{voice_name}» не сработал, использован «{voice}»"
+                )
+            except Exception:
+                pass
+            return audio
+        errors.append(f"«{voice}»: {err}")
+        if fatal:
+            break   # неверный ключ/нет прав — резервный голос не поможет
 
-            if response.status_code == 200 and response.content:
-                _set_tts_error(None)
-                try:
-                    st.session_state["tts_notice"] = (
-                        None if voice == voice_name
-                        else f"голос «{voice_name}» недоступен, использован «{voice}»"
-                    )
-                except Exception:
-                    pass
-                return response.content
-
-            body = (response.text or "").strip().replace("\n", " ")[:300]
-            last_error = f"Яндекс ответил {response.status_code}: {body}"
-            if "unsupported voice" in body.lower():
-                break  # повтор без folderId бесполезен — переходим к резервному голосу
-
-    _set_tts_error(last_error)
+    joined = " | ".join(errors)
+    hint = " — сбой на стороне Яндекса, обычно проходит сам" if re.search(r"ответил 5\d\d", joined) else ""
+    _set_tts_error(joined + hint)
     return None
 
 
