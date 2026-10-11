@@ -2,6 +2,5 @@ streamlit==1.37.1
 starlette==0.37.2
 gigachat>=0.1.28
 streamlit-mic-recorder>=0.0.4
-edge-tts>=6.1.9
 requests>=2.31.0
 urllib3>=2.0.0
