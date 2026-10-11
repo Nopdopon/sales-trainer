@@ -81,6 +81,12 @@ def _yandex_http():
     return requests.Session()
 
 
+@st.cache_resource
+def _yandex_state() -> Dict:
+    """Общая память приложения: выяснили ли мы, что запросы нужно отправлять без folderId."""
+    return {"skip_folder_for": None}
+
+
 def _set_tts_error(msg: Optional[str]) -> None:
     """Запоминает причину сбоя озвучки (или очищает её), чтобы показать в интерфейсе."""
     try:
@@ -113,16 +119,22 @@ def _clean_for_tts(text: str) -> str:
     return t if re.search(r'\w', t) else ""
 
 
-def _synthesize_with_voice(voice: str, clean: str, headers: Dict[str, str], folder_id: str) -> tuple[Optional[bytes], str, bool]:
+def _synthesize_with_voice(voice: str, clean: str, headers: Dict[str, str],
+                           api_key: str, folder_id: str) -> tuple[Optional[bytes], str, bool]:
     """
     Одна попытка озвучки конкретным голосом (до 3 запросов).
     Возвращает (аудио | None, описание_ошибки, фатальная_ошибка_доступа).
-      • 5xx от Яндекса — это сбой на его стороне: повторяем с короткой паузой;
-      • прочие 4xx — один раз пробуем без folderId (для API-ключа он не обязателен);
-      • 401/403 — проблема ключа/прав, повторять бессмысленно.
+      • folderId для API-ключа сервисного аккаунта НЕ обязателен. Если Яндекс отклонил запрос
+        с folderId (401/403 «folder ID does not match» и т.п.) — повторяем без него; если без него
+        работает, дальше folderId вообще не отправляем (экономит один запрос на каждую реплику);
+      • 5xx от Яндекса — сбой на его стороне: короткая пауза и повтор;
+      • 401/403 уже БЕЗ folderId — проблема самого ключа/прав, повторять бессмысленно.
     """
-    use_folder = True
+    state = _yandex_state()
+    cred = (api_key, folder_id)
+    use_folder = bool(folder_id) and state.get("skip_folder_for") != cred
     last = "неизвестная ошибка"
+
     for attempt in range(3):
         payload = {"text": clean, "lang": "ru-RU", "voice": voice, "format": "mp3"}
         if use_folder:
@@ -134,19 +146,33 @@ def _synthesize_with_voice(voice: str, clean: str, headers: Dict[str, str], fold
             continue
 
         if resp.status_code == 200 and resp.content:
+            if folder_id and not use_folder:
+                state["skip_folder_for"] = cred   # без folderId работает — запоминаем
             return resp.content, "", False
 
         code = resp.status_code
-        body = (resp.text or "").strip().replace("\n", " ")[:300]
+        body = (resp.text or "").strip().replace("\n", " ")[:400]
         last = f"Яндекс ответил {code}: {body}"
 
         if code in (401, 403):
-            return None, last, True
+            if use_folder:
+                m = re.search(r"service account folder ID '([^']+)'", body)
+                try:
+                    st.session_state["tts_folder_hint"] = (
+                        "YANDEX_FOLDER_ID в Secrets не подходит"
+                        + (f": Яндекс ждёт каталог сервисного аккаунта «{m.group(1)}»" if m else "")
+                        + ". Замените значение или удалите эту строку — озвучка работает и без неё."
+                    )
+                except Exception:
+                    pass
+                use_folder = False      # пробуем без folderId
+                continue
+            return None, last, True     # ключ/права — повторять бессмысленно
         if "unsupported voice" in body.lower():
             break                       # этот голос не поддерживается — сразу к резервному
         if code >= 500:
             if attempt < 2:
-                time.sleep(0.4 * (attempt + 1))   # сбой на стороне Яндекса — короткая пауза и повтор
+                time.sleep(0.4 * (attempt + 1))   # сбой на стороне Яндекса — пауза и повтор
             continue
         if use_folder:
             use_folder = False          # другая 4xx — пробуем без folderId
@@ -164,14 +190,15 @@ def text_to_speech(text: str, voice_name: str = "filipp") -> Optional[bytes]:
         voice_name — техническое имя голоса Yandex (например "filipp", "alena" и т.д.),
                      закреплённое за конкретным персонажем.
 
-    Если голос не принимается или Яндекс отвечает ошибкой — пробуется резервный голос того же
-    пола (см. VOICE_FALLBACKS). При полном сбое возвращает None (приложение не падает), а причина
-    с названием голоса записывается в st.session_state["tts_error"] и показывается под чатом.
+    Обязателен только YANDEX_API_KEY; YANDEX_FOLDER_ID необязателен (для ключа сервисного
+    аккаунта каталог определяется автоматически). Если голос не принимается или Яндекс отвечает
+    ошибкой — пробуется резервный голос того же пола (см. VOICE_FALLBACKS). При полном сбое
+    возвращает None (приложение не падает), а причина с названием голоса записывается в
+    st.session_state["tts_error"] и показывается под чатом.
     """
     api_key, folder_id = _get_yandex_credentials()
-    if not api_key or not folder_id:
-        missing = [n for n, v in (("YANDEX_API_KEY", api_key), ("YANDEX_FOLDER_ID", folder_id)) if not v]
-        _set_tts_error("в Secrets не задано: " + ", ".join(missing))
+    if not api_key:
+        _set_tts_error("в Secrets не задан YANDEX_API_KEY")
         return None
 
     clean = _clean_for_tts(text)
@@ -187,7 +214,7 @@ def text_to_speech(text: str, voice_name: str = "filipp") -> Optional[bytes]:
 
     errors = []
     for voice in voices_to_try:
-        audio, err, fatal = _synthesize_with_voice(voice, clean, headers, folder_id)
+        audio, err, fatal = _synthesize_with_voice(voice, clean, headers, api_key, folder_id)
         if audio:
             _set_tts_error(None)
             try:
@@ -231,6 +258,8 @@ def play_pending_tts_audio() -> None:
         st.caption(f"🔇 Озвучка недоступна: {err}")
     elif st.session_state.get("tts_notice") and _auth_debug_enabled():
         st.caption(f"ℹ️ {st.session_state.tts_notice}")
+    if st.session_state.get("tts_folder_hint") and _auth_debug_enabled():
+        st.caption(f"ℹ️ {st.session_state.tts_folder_hint}")
 
 
 def _save_audio_to_tempfile(audio_bytes: bytes) -> Optional[str]:
