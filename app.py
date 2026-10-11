@@ -291,6 +291,9 @@ st.set_page_config(
 # который делает рабочий Playground.
 GIGACHAT_MODEL = "GigaChat-2"
 
+# Версия сборки — отображается внизу бокового меню, чтобы было видно, какой код запущен на сервере.
+APP_VERSION = "2026-10-11 · озвучка v4 (повторы, резервные голоса, folderId)"
+
 
 def _get_sber_key() -> str:
     """Читает SBER_AUTH_KEY из secrets.toml / переменной окружения."""
@@ -2105,6 +2108,8 @@ with st.sidebar:
         st.markdown(f"**Режим:** {'💬 Чат' if st.session_state.mode == 'chat' else '📞 Звонок'}")
         st.markdown(f"**Реплик:** {len(st.session_state.messages)}")
         st.markdown(f"**Слабых ответов подряд:** {st.session_state.weak_streak} / {p.patience}")
+        if _auth_debug_enabled():
+            st.markdown(f"**Голос озвучки:** `{p.voice}`")
     else:
         st.markdown("_Персонаж не выбран_")
 
@@ -2125,6 +2130,8 @@ with st.sidebar:
         st.session_state.mode = None
         reset_dialog_state()
         st.rerun()
+
+    st.caption(f"Версия: {APP_VERSION}")
 
 
 # ============================================================
