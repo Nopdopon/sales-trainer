@@ -20,7 +20,7 @@ import csv
 import random
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import List, Dict, Optional
 
@@ -75,12 +75,110 @@ def _get_yandex_credentials() -> tuple[str, str]:
     return api_key, folder_id
 
 
+@st.cache_resource
+def _yandex_http():
+    """Общая HTTP-сессия: соединение с Яндексом переиспользуется, а не открывается заново на каждую реплику."""
+    return requests.Session()
+
+
+@st.cache_resource
+def _yandex_state() -> Dict:
+    """Общая память приложения: выяснили ли мы, что запросы нужно отправлять без folderId."""
+    return {"skip_folder_for": None}
+
+
 def _set_tts_error(msg: Optional[str]) -> None:
     """Запоминает причину сбоя озвучки (или очищает её), чтобы показать в интерфейсе."""
     try:
         st.session_state["tts_error"] = msg
     except Exception:
         pass
+
+
+# Резервные голоса: если Яндекс отклонил голос ("Unsupported voice"), пробуем надёжный
+# голос того же пола, чтобы персонаж не оставался без озвучки.
+VOICE_FALLBACKS = {
+    # женские -> alena
+    "julia": "alena", "dasha": "alena", "marina": "alena", "lera": "alena", "masha": "alena",
+    # мужские -> filipp
+    "zahar": "filipp", "madi_ru": "filipp", "madirus": "filipp", "ermil": "filipp",
+}
+
+
+def _clean_for_tts(text: str) -> str:
+    """
+    Готовит реплику к синтезу: убирает ремарки (*кладёт трубку*), эмодзи и символы разметки,
+    на которых синтез речи может сбоиться, и схлопывает лишние пробелы.
+    Возвращает пустую строку, если озвучивать нечего (например, остались одни знаки препинания).
+    """
+    t = re.sub(r'\*\*([^*]+)\*\*', r'\1', text)                   # **жирный** -> обычный текст (слова остаются)
+    t = re.sub(r'\*[^*]+\*', '', t)                              # ремарки вида *бросает трубку*
+    t = re.sub(r'[\U00010000-\U0010FFFF\u200d\ufe0f\u2600-\u27BF]', '', t)   # эмодзи и пиктограммы
+    t = re.sub(r'[*_`#~|<>\[\]{}\\]', ' ', t)                    # символы разметки
+    t = re.sub(r'\s+', ' ', t).strip()
+    return t if re.search(r'\w', t) else ""
+
+
+def _synthesize_with_voice(voice: str, clean: str, headers: Dict[str, str],
+                           api_key: str, folder_id: str) -> tuple[Optional[bytes], str, bool]:
+    """
+    Одна попытка озвучки конкретным голосом (до 3 запросов).
+    Возвращает (аудио | None, описание_ошибки, фатальная_ошибка_доступа).
+      • folderId для API-ключа сервисного аккаунта НЕ обязателен. Если Яндекс отклонил запрос
+        с folderId (401/403 «folder ID does not match» и т.п.) — повторяем без него; если без него
+        работает, дальше folderId вообще не отправляем (экономит один запрос на каждую реплику);
+      • 5xx от Яндекса — сбой на его стороне: короткая пауза и повтор;
+      • 401/403 уже БЕЗ folderId — проблема самого ключа/прав, повторять бессмысленно.
+    """
+    state = _yandex_state()
+    cred = (api_key, folder_id)
+    use_folder = bool(folder_id) and state.get("skip_folder_for") != cred
+    last = "неизвестная ошибка"
+
+    for attempt in range(3):
+        payload = {"text": clean, "lang": "ru-RU", "voice": voice, "format": "mp3"}
+        if use_folder:
+            payload["folderId"] = folder_id
+        try:
+            resp = _yandex_http().post(YANDEX_TTS_URL, headers=headers, data=payload, timeout=(5, 20))
+        except Exception as ex:
+            last = f"нет связи с Яндексом ({type(ex).__name__})"
+            continue
+
+        if resp.status_code == 200 and resp.content:
+            if folder_id and not use_folder:
+                state["skip_folder_for"] = cred   # без folderId работает — запоминаем
+            return resp.content, "", False
+
+        code = resp.status_code
+        body = (resp.text or "").strip().replace("\n", " ")[:400]
+        last = f"Яндекс ответил {code}: {body}"
+
+        if code in (401, 403):
+            if use_folder:
+                m = re.search(r"service account folder ID '([^']+)'", body)
+                try:
+                    st.session_state["tts_folder_hint"] = (
+                        "YANDEX_FOLDER_ID в Secrets не подходит"
+                        + (f": Яндекс ждёт каталог сервисного аккаунта «{m.group(1)}»" if m else "")
+                        + ". Замените значение или удалите эту строку — озвучка работает и без неё."
+                    )
+                except Exception:
+                    pass
+                use_folder = False      # пробуем без folderId
+                continue
+            return None, last, True     # ключ/права — повторять бессмысленно
+        if "unsupported voice" in body.lower():
+            break                       # этот голос не поддерживается — сразу к резервному
+        if code >= 500:
+            if attempt < 2:
+                time.sleep(0.4 * (attempt + 1))   # сбой на стороне Яндекса — пауза и повтор
+            continue
+        if use_folder:
+            use_folder = False          # другая 4xx — пробуем без folderId
+            continue
+        break
+    return None, last, False
 
 
 def text_to_speech(text: str, voice_name: str = "filipp") -> Optional[bytes]:
@@ -92,67 +190,76 @@ def text_to_speech(text: str, voice_name: str = "filipp") -> Optional[bytes]:
         voice_name — техническое имя голоса Yandex (например "filipp", "alena" и т.д.),
                      закреплённое за конкретным персонажем.
 
-    При сбое возвращает None (приложение не падает), а причина записывается в
-    st.session_state["tts_error"] и показывается пользователю под чатом.
+    Обязателен только YANDEX_API_KEY; YANDEX_FOLDER_ID необязателен (для ключа сервисного
+    аккаунта каталог определяется автоматически). Если голос не принимается или Яндекс отвечает
+    ошибкой — пробуется резервный голос того же пола (см. VOICE_FALLBACKS). При полном сбое
+    возвращает None (приложение не падает), а причина с названием голоса записывается в
+    st.session_state["tts_error"] и показывается под чатом.
     """
     api_key, folder_id = _get_yandex_credentials()
-    if not api_key or not folder_id:
-        missing = [n for n, v in (("YANDEX_API_KEY", api_key), ("YANDEX_FOLDER_ID", folder_id)) if not v]
-        _set_tts_error("в Secrets не задано: " + ", ".join(missing))
+    if not api_key:
+        _set_tts_error("в Secrets не задан YANDEX_API_KEY")
         return None
 
-    # Убираем ремарки вида *бросает трубку*, *кладёт трубку* — они не нужны в аудио
-    clean = re.sub(r'\*[^*]+\*', '', text).strip()
+    clean = _clean_for_tts(text)
     if not clean:
         return None
 
-    headers = {
-        "Authorization": f"Api-Key {api_key}",
-    }
-    base = {
-        "text": clean,
-        "lang": "ru-RU",
-        "voice": voice_name,
-        "format": "mp3",
-    }
+    headers = {"Authorization": f"Api-Key {api_key}"}
 
-    # 1-я попытка — как в задании (с folderId). Если Яндекс не принял запрос, пробуем без
-    # folderId: для API-ключа сервисного аккаунта он не обязателен и иногда вызывает отказ.
-    attempts = [dict(base, folderId=folder_id), dict(base)]
-    last_error = "неизвестная ошибка"
-    for payload in attempts:
-        try:
-            response = requests.post(YANDEX_TTS_URL, headers=headers, data=payload, timeout=20)
-        except Exception as ex:
-            last_error = f"нет связи с Яндексом ({type(ex).__name__})"
-            continue
-        if response.status_code == 200 and response.content:
+    voices_to_try = [voice_name]
+    fallback = VOICE_FALLBACKS.get(voice_name)
+    if fallback and fallback != voice_name:
+        voices_to_try.append(fallback)
+
+    errors = []
+    for voice in voices_to_try:
+        audio, err, fatal = _synthesize_with_voice(voice, clean, headers, api_key, folder_id)
+        if audio:
             _set_tts_error(None)
-            return response.content
-        body = (response.text or "").strip().replace("\n", " ")[:300]
-        last_error = f"Яндекс ответил {response.status_code}: {body}"
+            try:
+                st.session_state["tts_notice"] = (
+                    None if voice == voice_name
+                    else f"голос «{voice_name}» не сработал, использован «{voice}»"
+                )
+            except Exception:
+                pass
+            return audio
+        errors.append(f"«{voice}»: {err}")
+        if fatal:
+            break   # неверный ключ/нет прав — резервный голос не поможет
 
-    _set_tts_error(last_error)
+    joined = " | ".join(errors)
+    hint = " — сбой на стороне Яндекса, обычно проходит сам" if re.search(r"ответил 5\d\d", joined) else ""
+    _set_tts_error(joined + hint)
     return None
 
 
 def play_pending_tts_audio() -> None:
     """
-    Проигрывает последнюю озвученную реплику персонажа (если есть) и удаляет временный файл.
-    Плеер на странице скрыт CSS — звук включается автоматически, без виджета.
-    Если озвучка не получилась — под чатом показывается причина.
+    Озвучивает реплику клиента из очереди (st.session_state.pending_tts) и проигрывает её.
+    Вызывается в КОНЦЕ экрана: к этому моменту текст ответа и поля ввода уже показаны,
+    поэтому пользователь видит реплику сразу, а звук подключается следом.
+    Плеер скрыт CSS — звук включается автоматически, без виджета.
     """
-    path = st.session_state.get("last_tts_audio")
-    if path:
-        st.audio(path, format="audio/mp3", autoplay=True)
-        st.session_state.last_tts_audio = None   # сбрасываем, чтобы не проигрывать повторно при rerun
-        try:
-            os.remove(path)   # временный файл больше не нужен
-        except Exception:
-            pass
+    pending = st.session_state.get("pending_tts")
+    if pending:
+        st.session_state.pending_tts = None   # сбрасываем, чтобы не озвучивать повторно при rerun
+        audio = text_to_speech(pending["text"], voice_name=pending["voice"])
+        path = _save_audio_to_tempfile(audio) if audio else None
+        if path:
+            st.audio(path, format="audio/mp3", autoplay=True)
+            try:
+                os.remove(path)   # временный файл больше не нужен
+            except Exception:
+                pass
     err = st.session_state.get("tts_error")
     if err:
         st.caption(f"🔇 Озвучка недоступна: {err}")
+    elif st.session_state.get("tts_notice") and _auth_debug_enabled():
+        st.caption(f"ℹ️ {st.session_state.tts_notice}")
+    if st.session_state.get("tts_folder_hint") and _auth_debug_enabled():
+        st.caption(f"ℹ️ {st.session_state.tts_folder_hint}")
 
 
 def _save_audio_to_tempfile(audio_bytes: bytes) -> Optional[str]:
@@ -233,7 +340,7 @@ CLIENTS_DB: Dict[str, Persona] = {
         emoji="🙂",
         avatar_url="",
         gender="male",
-        voice="madirus",
+        voice="madi_ru",
         level="Новичок",
         level_color="#22c55e",
         call_type="Тёплый",
@@ -269,7 +376,7 @@ CLIENTS_DB: Dict[str, Persona] = {
         emoji="😟",
         avatar_url="https://images.unsplash.com/photo-1500648767791-00dcc994a43e?w=150",
         gender="male",
-        voice="madirus",
+        voice="madi_ru",
         level="Новичок",
         level_color="#22c55e",
         call_type="Тёплый",
@@ -306,7 +413,7 @@ CLIENTS_DB: Dict[str, Persona] = {
         emoji="🧐",
         avatar_url="",
         gender="female",
-        voice="julia",
+        voice="marina",
         level="Опытный",
         level_color="#f59e0b",
         call_type="Холодный",
@@ -562,7 +669,7 @@ CLIENTS_DB: Dict[str, Persona] = {
         emoji="🔧",
         avatar_url="https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?w=150",
         gender="male",
-        voice="madirus",
+        voice="madi_ru",
         level="Хардкор",
         level_color="#ef4444",
         call_type="Холодный B2B",
@@ -598,7 +705,7 @@ CLIENTS_DB: Dict[str, Persona] = {
         emoji="💰",
         avatar_url="https://images.unsplash.com/photo-1580489944761-15a19d654956?w=150",
         gender="female",
-        voice="julia",
+        voice="marina",
         level="Опытный",
         level_color="#f59e0b",
         call_type="Холодный B2B",
@@ -635,7 +742,7 @@ CLIENTS_DB: Dict[str, Persona] = {
         emoji="😴",
         avatar_url="https://images.unsplash.com/photo-1472099645785-5658abf4ff4e?w=150",
         gender="male",
-        voice="madirus",
+        voice="madi_ru",
         level="Новичок",
         level_color="#22c55e",
         call_type="Холодный B2B",
@@ -826,6 +933,172 @@ def save_to_csv(persona: "Persona", result: Dict) -> bool:
 
 
 # ============================================================
+#  ИСТОРИЯ ТРЕНИРОВОК В БАЗЕ ДАННЫХ (Supabase / Postgres через REST API)
+# ============================================================
+#  Подключение — через Secrets: SUPABASE_URL и SUPABASE_KEY (секретный ключ, только на сервере).
+#  Если они не заданы, приложение работает как раньше (сохранение в CSV-файл).
+#  Таблица создаётся скриптом supabase_schema.sql.
+
+SB_TABLE = "sessions"
+_SB_LIST_COLS = "id,created_at,user_login,company,persona_name,topic,call_type,mode,score,summary"
+_VALID_ROLES = ("manager", "rop", "admin")
+
+
+def _get_supabase_config() -> tuple[str, str]:
+    """Читает SUPABASE_URL и SUPABASE_KEY из secrets.toml / переменных окружения."""
+    url = os.environ.get("SUPABASE_URL", "")
+    key = os.environ.get("SUPABASE_KEY", "")
+    try:
+        if not url:
+            url = st.secrets.get("SUPABASE_URL", "")
+        if not key:
+            key = st.secrets.get("SUPABASE_KEY", "")
+    except Exception:
+        pass
+    return str(url).strip().rstrip("/"), str(key).strip()
+
+
+def db_enabled() -> bool:
+    """True, если база подключена (заданы SUPABASE_URL и SUPABASE_KEY)."""
+    url, key = _get_supabase_config()
+    return bool(url and key)
+
+
+def _sb_headers(key: str, prefer: Optional[str] = None) -> Dict[str, str]:
+    headers = {"apikey": key, "Content-Type": "application/json"}
+    # Старые ключи (JWT, начинаются с "eyJ") нужны и в Authorization; новые "sb_secret_..." — только в apikey.
+    if key.startswith("eyJ"):
+        headers["Authorization"] = f"Bearer {key}"
+    if prefer:
+        headers["Prefer"] = prefer
+    return headers
+
+
+def save_session_to_db(persona: "Persona", result: Dict) -> tuple[bool, str]:
+    """Сохраняет тренировку (диалог + разбор судьи) в базу. Возвращает (успех, текст_ошибки)."""
+    url, key = _get_supabase_config()
+    if not url or not key:
+        return False, "база не настроена"
+
+    score = result.get("score")
+    try:
+        score = max(1, min(10, int(score)))
+    except (TypeError, ValueError):
+        score = None
+
+    row = {
+        "user_login": st.session_state.get("current_user") or "unknown",
+        "company": st.session_state.get("current_company") or None,
+        "persona_key": persona.key,
+        "persona_name": persona.name,
+        "topic": persona.topic,
+        "call_type": persona.call_type,
+        "level": persona.level,
+        "mode": st.session_state.get("mode"),
+        "score": score,
+        "summary": result.get("summary"),
+        "strengths": result.get("strengths") or [],
+        "mistakes": result.get("mistakes") or [],
+        "price_handling": result.get("price_handling"),
+        "next_steps": result.get("next_steps") or [],
+        "transcript": st.session_state.get("messages", []),
+        "is_partial": bool(result.get("_partial")),
+    }
+    try:
+        resp = requests.post(
+            f"{url}/rest/v1/{SB_TABLE}",
+            headers=_sb_headers(key, prefer="return=minimal"),
+            json=row,
+            timeout=(5, 15),
+        )
+    except Exception as ex:
+        return False, f"нет связи с базой ({type(ex).__name__})"
+    if resp.status_code in (200, 201, 204):
+        return True, ""
+    return False, f"база ответила {resp.status_code}: {(resp.text or '')[:200]}"
+
+
+def _history_scope(team: bool) -> Optional[Dict[str, str]]:
+    """
+    Какие записи разрешено видеть текущему пользователю. Роль и компания берутся из Secrets
+    при входе (не из ввода пользователя), фильтр применяется на сервере приложения.
+      • «Моя история» — только свои записи (для любой роли);
+      • «Команда» — РОП видит свою компанию, админ — всё; менеджеру недоступно.
+    Возвращает None, если доступа нет.
+    """
+    role = st.session_state.get("current_role", "manager")
+    login = st.session_state.get("current_user") or ""
+    company = st.session_state.get("current_company") or ""
+    if team:
+        if role == "admin":
+            return {}
+        if role == "rop" and company:
+            return {"company": f"eq.{company}"}
+        return None
+    if not login:
+        return None
+    return {"user_login": f"eq.{login}"}
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def _fetch_sessions_cached(scope_items: tuple, limit: int) -> tuple[list, str]:
+    url, key = _get_supabase_config()
+    if not url or not key:
+        return [], "база не настроена"
+    params = dict(scope_items)
+    params.update({"select": _SB_LIST_COLS, "order": "created_at.desc", "limit": str(limit)})
+    try:
+        resp = requests.get(f"{url}/rest/v1/{SB_TABLE}", headers=_sb_headers(key), params=params, timeout=(5, 15))
+    except Exception as ex:
+        return [], f"нет связи с базой ({type(ex).__name__})"
+    if resp.status_code != 200:
+        return [], f"база ответила {resp.status_code}: {(resp.text or '')[:200]}"
+    try:
+        return resp.json(), ""
+    except Exception:
+        return [], "база вернула некорректный ответ"
+
+
+def fetch_sessions(team: bool, limit: int = 500) -> tuple[list, str]:
+    """Список тренировок (краткие поля) в рамках прав текущего пользователя."""
+    scope = _history_scope(team)
+    if scope is None:
+        return [], ("Для роли РОП в Secrets нужно указать company." if team else "Не удалось определить пользователя.")
+    return _fetch_sessions_cached(tuple(sorted(scope.items())), limit)
+
+
+def fetch_session_detail(session_id: str, team: bool) -> tuple[Optional[Dict], str]:
+    """Полная запись (разбор + диалог). Те же ограничения доступа, что и у списка."""
+    if not re.fullmatch(r"[0-9a-fA-F\-]{36}", str(session_id)):
+        return None, "некорректный идентификатор записи"
+    scope = _history_scope(team)
+    if scope is None:
+        return None, "нет доступа"
+    url, key = _get_supabase_config()
+    params = dict(scope)
+    params.update({"id": f"eq.{session_id}", "select": "*", "limit": "1"})
+    try:
+        resp = requests.get(f"{url}/rest/v1/{SB_TABLE}", headers=_sb_headers(key), params=params, timeout=(5, 15))
+    except Exception as ex:
+        return None, f"нет связи с базой ({type(ex).__name__})"
+    if resp.status_code != 200:
+        return None, f"база ответила {resp.status_code}: {(resp.text or '')[:200]}"
+    data = resp.json()
+    if not data:
+        return None, "запись не найдена или нет доступа"
+    return data[0], ""
+
+
+def _fmt_dt(iso: str) -> str:
+    """ISO-время из базы (UTC) -> «дд.мм.гггг чч:мм» по Москве."""
+    try:
+        dt = datetime.fromisoformat(str(iso).replace("Z", "+00:00"))
+        return dt.astimezone(timezone(timedelta(hours=3))).strftime("%d.%m.%Y %H:%M")
+    except Exception:
+        return str(iso)[:16]
+
+
+# ============================================================
 #  AI JUDGE — системный промпт для итоговой оценки (БЕЗ ИЗМЕНЕНИЙ)
 # ============================================================
 JUDGE_SYSTEM_PROMPT = """Ты — опытный директор отдела продаж и бизнес-тренер с 15-летним стажем,
@@ -969,6 +1242,11 @@ def screen_login():
                 if result == "ok":
                     st.session_state.authenticated = True
                     st.session_state.current_user = login.strip().lower()
+                    # Роль и компания задаются в Secrets (role = "manager" | "rop" | "admin", company = "...")
+                    _profile = _get_users().get(login.strip().lower(), {})
+                    _role = str(_profile.get("role", "manager")).strip().lower()
+                    st.session_state.current_role = _role if _role in _VALID_ROLES else "manager"
+                    st.session_state.current_company = str(_profile.get("company", "")).strip()
                     st.rerun()
                 elif result == "expired":
                     st.error("⏰ Срок вашего доступа истёк. Обратитесь к администратору для продления.")
@@ -998,6 +1276,10 @@ def require_auth():
         st.session_state.authenticated = False
     if "current_user" not in st.session_state:
         st.session_state.current_user = None
+    if "current_role" not in st.session_state:
+        st.session_state.current_role = "manager"
+    if "current_company" not in st.session_state:
+        st.session_state.current_company = ""
 
     if not st.session_state.authenticated:
         screen_login()
@@ -1025,7 +1307,7 @@ def init_session_state():
         "auto_ended": False,
         "filter_topic": None,       # выбранная тема на экране меню
         "filter_call_type": None,   # выбранный тип звонка на экране меню
-        "last_tts_audio": None,     # байты MP3 последней реплики ИИ-клиента для autoplay
+        "pending_tts": None,        # реплика ИИ-клиента, ожидающая озвучки
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -1468,6 +1750,7 @@ def reset_dialog_state():
     st.session_state.deal_closed = False
     st.session_state.turn_count = 0
     st.session_state.auto_ended = False
+    st.session_state.pending_tts = None
 
 
 WEAK_MARKERS = [
@@ -1787,6 +2070,8 @@ with st.sidebar:
     if st.button("🚪 Выйти", use_container_width=True):
         st.session_state.authenticated = False
         st.session_state.current_user = None
+        st.session_state.current_role = "manager"
+        st.session_state.current_company = ""
         st.rerun()
 
     st.divider()
@@ -1822,6 +2107,16 @@ with st.sidebar:
         st.markdown(f"**Слабых ответов подряд:** {st.session_state.weak_streak} / {p.patience}")
     else:
         st.markdown("_Персонаж не выбран_")
+
+    if db_enabled():
+        st.divider()
+        if st.button("📚 Моя история", use_container_width=True, key="nav_history"):
+            st.session_state.screen = "history"
+            st.rerun()
+        if st.session_state.get("current_role") in ("rop", "admin"):
+            if st.button("👥 Команда", use_container_width=True, key="nav_team"):
+                st.session_state.screen = "team"
+                st.rerun()
 
     st.divider()
     if st.button("🔄 Начать заново (в меню)", use_container_width=True):
@@ -2053,8 +2348,9 @@ def manager_send(text: str, persona: Persona) -> Optional[str]:
 
     # Озвучка ответа ИИ-клиента (Yandex SpeechKit)
     # Озвучка именно тем голосом Yandex, который закреплён за этим персонажем
-    audio_bytes = text_to_speech(reply, voice_name=persona.voice)
-    st.session_state.last_tts_audio = _save_audio_to_tempfile(audio_bytes) if audio_bytes else None
+    # ВАЖНО: звук здесь НЕ синтезируется — иначе текст ответа появился бы только после озвучки.
+    # Реплика ставится в очередь и озвучивается уже ПОСЛЕ того, как страница с текстом отрисована.
+    st.session_state.pending_tts = {"text": reply, "voice": persona.voice}
 
     # Повторная проверка авто-завершения после обновления стресса
     if check_auto_end(persona):
@@ -2125,7 +2421,6 @@ def screen_chat():
     st.divider()
 
     # Автовоспроизведение последней реплики ИИ-клиента
-    play_pending_tts_audio()
 
     if st.session_state.auto_ended:
         st.error(f"💬 {persona.name} прервал чат — переходим к разбору полётов.")
@@ -2196,6 +2491,9 @@ def screen_chat():
         st.info("Диалог завершён. Переход к разбору полётов...")
         st.session_state.screen = "review"
         st.rerun()
+
+    # Озвучка — в самом конце экрана, когда текст и ввод уже отрисованы
+    play_pending_tts_audio()
 
 
 # ============================================================
@@ -2273,8 +2571,7 @@ def screen_call():
                     "role": "client", "text": opening, "ts": datetime.now().strftime("%H:%M"),
                 })
                 # Первая фраза клиента тоже озвучивается его голосом
-                _open_audio = text_to_speech(opening, voice_name=persona.voice)
-                st.session_state.last_tts_audio = _save_audio_to_tempfile(_open_audio) if _open_audio else None
+                st.session_state.pending_tts = {"text": opening, "voice": persona.voice}
                 st.rerun()
         return
 
@@ -2316,7 +2613,6 @@ def screen_call():
     render_call_log(persona)
 
     # Автовоспроизведение последней реплики ИИ-клиента
-    play_pending_tts_audio()
 
     if st.session_state.call_ended_reason == "auto_hangup":
         st.error(f"📵 {persona.name} прервал разговор автоматически — слишком высокий стресс или много слабых ответов подряд.")
@@ -2382,6 +2678,9 @@ def screen_call():
             st.session_state.screen = "review"
             st.rerun()
 
+    # Озвучка — в самом конце экрана, когда текст и ввод уже отрисованы
+    play_pending_tts_audio()
+
 
 def render_call_log(persona: Persona):
     chat_container = st.container(height=340)
@@ -2403,6 +2702,106 @@ def render_call_log(persona: Persona):
                         <div class="chat-bubble-manager">{m['text']}</div>
                     </div>
                 </div>""", unsafe_allow_html=True)
+
+
+def render_review_body(result: Dict) -> None:
+    """Карточка разбора ИИ-судьи: оценка, вывод, сильные стороны, ошибки, цена, рекомендации.
+    Используется и после звонка, и в истории — оформление везде одинаковое."""
+    score = result.get("score", 5)
+    try:
+        score = int(score)
+    except (TypeError, ValueError):
+        score = 5
+
+    if score >= 8:
+        score_color = "#2DCD73"
+        score_glow = "rgba(45,205,115,0.5)"
+        score_label = "Отличный результат"
+    elif score >= 5:
+        score_color = "#F5A623"
+        score_glow = "rgba(245,166,35,0.4)"
+        score_label = "Есть над чем поработать"
+    else:
+        score_color = "#FF4B4B"
+        score_glow = "rgba(255,75,75,0.5)"
+        score_label = "Нужна серьёзная работа над ошибками"
+
+    col1, col2 = st.columns([1, 3])
+    with col1:
+        st.markdown(f"""
+        <div style="text-align:center;background:rgba(15,15,36,0.8);border-radius:16px;
+                    padding:24px 16px;border:1px solid {score_color}44;
+                    box-shadow:0 0 30px {score_glow};">
+            <div class="score-badge" style="color:{score_color};text-shadow:0 0 24px {score_glow};">{score}</div>
+            <div style="font-size:11px;color:{score_color};font-weight:700;letter-spacing:1px;margin-top:2px;">/ 10</div>
+            <div style="color:#505070;font-size:12px;margin-top:8px;">{score_label}</div>
+        </div>
+        """, unsafe_allow_html=True)
+    with col2:
+        st.markdown(f"""
+        <div class="review-card">
+            <div style="font-size:13px;font-weight:700;color:#7070a0;letter-spacing:1px;margin-bottom:8px;">📝 ОБЩИЙ ВЫВОД</div>
+            <div style="color:#c0c0e0;line-height:1.6;font-size:14px;">{result.get("summary", "—")}</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
+    col_s, col_m = st.columns(2)
+    with col_s:
+        st.markdown(f"""
+        <div class="review-card" style="border-color:rgba(45,205,115,0.3);box-shadow:0 0 16px rgba(45,205,115,0.07);">
+            <div style="font-size:13px;font-weight:700;color:#2DCD73;letter-spacing:1px;margin-bottom:10px;">✅ СИЛЬНЫЕ СТОРОНЫ</div>
+        """, unsafe_allow_html=True)
+        strengths = result.get("strengths", [])
+        if strengths:
+            for s in strengths:
+                st.markdown(f"- {s}")
+        else:
+            st.caption("Не указаны.")
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    with col_m:
+        st.markdown(f"""
+        <div class="review-card" style="border-color:rgba(255,75,75,0.25);box-shadow:0 0 16px rgba(255,75,75,0.07);">
+            <div style="font-size:13px;font-weight:700;color:#FF4B4B;letter-spacing:1px;margin-bottom:10px;">❌ ОШИБКИ И СЛАБЫЕ МЕСТА</div>
+        """, unsafe_allow_html=True)
+        mistakes = result.get("mistakes", [])
+        if mistakes:
+            for mistake in mistakes:
+                with st.expander(f"⚠️ {mistake.get('moment', 'Момент')}"):
+                    st.markdown(f"**Проблема:** {mistake.get('issue', '')}")
+                    st.markdown(f"**Как нужно было:** {mistake.get('fix', '')}")
+        else:
+            st.caption("Существенных ошибок не выявлено.")
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
+
+    # ── Работа с ценой ──────────────────────────────────────
+    price_text = result.get("price_handling", "—")
+    st.markdown(f"""
+    <div class="review-card" style="border-color:rgba(127,86,217,0.3);box-shadow:0 0 16px rgba(127,86,217,0.07);">
+        <div style="font-size:13px;font-weight:700;color:#7F56D9;letter-spacing:1px;margin-bottom:8px;">💰 РАБОТА С ЦЕНОЙ</div>
+        <div style="color:#c0c0e0;font-size:14px;line-height:1.6;">{price_text}</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # ── Рекомендации ────────────────────────────────────────
+    next_steps = result.get("next_steps", [])
+    if next_steps:
+        steps_html = "".join(
+            f'<div style="display:flex;gap:10px;margin-bottom:8px;">'
+            f'<span style="color:#7F56D9;font-weight:700;flex-shrink:0;">→</span>'
+            f'<span style="color:#c0c0e0;font-size:14px;line-height:1.5;">{s}</span>'
+            f'</div>'
+            for s in next_steps
+        )
+        st.markdown(f"""
+        <div class="review-card">
+            <div style="font-size:13px;font-weight:700;color:#60a5fa;letter-spacing:1px;margin-bottom:10px;">🚀 РЕКОМЕНДАЦИИ НА БУДУЩЕЕ</div>
+            {steps_html}
+        </div>
+        """, unsafe_allow_html=True)
 
 
 # ============================================================
@@ -2500,115 +2899,31 @@ def screen_review():
             st.session_state.review_error = None
             st.rerun()
 
-    score = result.get("score", 5)
-    try:
-        score = int(score)
-    except (TypeError, ValueError):
-        score = 5
-
-    if score >= 8:
-        score_color = "#2DCD73"
-        score_glow = "rgba(45,205,115,0.5)"
-        score_label = "Отличный результат"
-    elif score >= 5:
-        score_color = "#F5A623"
-        score_glow = "rgba(245,166,35,0.4)"
-        score_label = "Есть над чем поработать"
-    else:
-        score_color = "#FF4B4B"
-        score_glow = "rgba(255,75,75,0.5)"
-        score_label = "Нужна серьёзная работа над ошибками"
-
-    col1, col2 = st.columns([1, 3])
-    with col1:
-        st.markdown(f"""
-        <div style="text-align:center;background:rgba(15,15,36,0.8);border-radius:16px;
-                    padding:24px 16px;border:1px solid {score_color}44;
-                    box-shadow:0 0 30px {score_glow};">
-            <div class="score-badge" style="color:{score_color};text-shadow:0 0 24px {score_glow};">{score}</div>
-            <div style="font-size:11px;color:{score_color};font-weight:700;letter-spacing:1px;margin-top:2px;">/ 10</div>
-            <div style="color:#505070;font-size:12px;margin-top:8px;">{score_label}</div>
-        </div>
-        """, unsafe_allow_html=True)
-    with col2:
-        st.markdown(f"""
-        <div class="review-card">
-            <div style="font-size:13px;font-weight:700;color:#7070a0;letter-spacing:1px;margin-bottom:8px;">📝 ОБЩИЙ ВЫВОД</div>
-            <div style="color:#c0c0e0;line-height:1.6;font-size:14px;">{result.get("summary", "—")}</div>
-        </div>
-        """, unsafe_allow_html=True)
-
-    st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
-    col_s, col_m = st.columns(2)
-    with col_s:
-        st.markdown(f"""
-        <div class="review-card" style="border-color:rgba(45,205,115,0.3);box-shadow:0 0 16px rgba(45,205,115,0.07);">
-            <div style="font-size:13px;font-weight:700;color:#2DCD73;letter-spacing:1px;margin-bottom:10px;">✅ СИЛЬНЫЕ СТОРОНЫ</div>
-        """, unsafe_allow_html=True)
-        strengths = result.get("strengths", [])
-        if strengths:
-            for s in strengths:
-                st.markdown(f"- {s}")
-        else:
-            st.caption("Не указаны.")
-        st.markdown("</div>", unsafe_allow_html=True)
-
-    with col_m:
-        st.markdown(f"""
-        <div class="review-card" style="border-color:rgba(255,75,75,0.25);box-shadow:0 0 16px rgba(255,75,75,0.07);">
-            <div style="font-size:13px;font-weight:700;color:#FF4B4B;letter-spacing:1px;margin-bottom:10px;">❌ ОШИБКИ И СЛАБЫЕ МЕСТА</div>
-        """, unsafe_allow_html=True)
-        mistakes = result.get("mistakes", [])
-        if mistakes:
-            for mistake in mistakes:
-                with st.expander(f"⚠️ {mistake.get('moment', 'Момент')}"):
-                    st.markdown(f"**Проблема:** {mistake.get('issue', '')}")
-                    st.markdown(f"**Как нужно было:** {mistake.get('fix', '')}")
-        else:
-            st.caption("Существенных ошибок не выявлено.")
-        st.markdown("</div>", unsafe_allow_html=True)
-
-    st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
-
-    # ── Работа с ценой ──────────────────────────────────────
-    price_text = result.get("price_handling", "—")
-    st.markdown(f"""
-    <div class="review-card" style="border-color:rgba(127,86,217,0.3);box-shadow:0 0 16px rgba(127,86,217,0.07);">
-        <div style="font-size:13px;font-weight:700;color:#7F56D9;letter-spacing:1px;margin-bottom:8px;">💰 РАБОТА С ЦЕНОЙ</div>
-        <div style="color:#c0c0e0;font-size:14px;line-height:1.6;">{price_text}</div>
-    </div>
-    """, unsafe_allow_html=True)
-
-    # ── Рекомендации ────────────────────────────────────────
-    next_steps = result.get("next_steps", [])
-    if next_steps:
-        steps_html = "".join(
-            f'<div style="display:flex;gap:10px;margin-bottom:8px;">'
-            f'<span style="color:#7F56D9;font-weight:700;flex-shrink:0;">→</span>'
-            f'<span style="color:#c0c0e0;font-size:14px;line-height:1.5;">{s}</span>'
-            f'</div>'
-            for s in next_steps
-        )
-        st.markdown(f"""
-        <div class="review-card">
-            <div style="font-size:13px;font-weight:700;color:#60a5fa;letter-spacing:1px;margin-bottom:10px;">🚀 РЕКОМЕНДАЦИИ НА БУДУЩЕЕ</div>
-            {steps_html}
-        </div>
-        """, unsafe_allow_html=True)
+    render_review_body(result)
 
     st.markdown("<div style='height:16px'></div>", unsafe_allow_html=True)
     st.divider()
 
-    # ── Автосохранение в CSV ─────────────────────────────────
-    save_key = f"csv_saved_{id(result)}"
-    if not st.session_state.get(save_key):
-        saved = save_to_csv(persona, result)
-        st.session_state[save_key] = True
-        if saved:
-            st.success("💾 Результат сохранён в `kosmos_history.csv`")
+    # ── Автосохранение: в базу (история аккаунта) или, если база не подключена, в CSV ──
+    if "_saved_status" not in result:
+        if db_enabled():
+            ok, db_err = save_session_to_db(persona, result)
+            if ok:
+                result["_saved_status"] = ("ok", "💾 Тренировка сохранена в вашу историю — раздел «📚 Моя история» в боковом меню.")
+            else:
+                save_to_csv(persona, result)   # резервная копия, чтобы результат не потерялся
+                result["_saved_status"] = ("warn", f"⚠️ Не удалось сохранить в базу ({db_err}). Копия записана во временный файл.")
+        else:
+            saved = save_to_csv(persona, result)
+            result["_saved_status"] = (
+                ("ok", "💾 Результат сохранён в `kosmos_history.csv`") if saved
+                else ("warn", "⚠️ Не удалось сохранить результат.")
+            )
+    _kind, _msg = result["_saved_status"]
+    (st.success if _kind == "ok" else st.warning)(_msg)
 
-    # Кнопка скачивания CSV если файл существует
-    if HISTORY_CSV.exists():
+    # Скачивание CSV — только если база не подключена
+    if not db_enabled() and HISTORY_CSV.exists():
         with open(HISTORY_CSV, "rb") as f:
             st.download_button(
                 label="⬇️ Скачать историю диалогов (CSV)",
@@ -2639,6 +2954,199 @@ def screen_review():
 
 
 # ============================================================
+#  ЭКРАН: ИСТОРИЯ ТРЕНИРОВОК («Моя история» / «Команда»)
+# ============================================================
+def screen_history(team: bool = False):
+    """
+    team=False — личная история пользователя; team=True — тренировки команды (РОП: своя компания,
+    админ: все). Таблица содержит только короткие поля; полный разбор судьи и диалог открываются
+    по клику на строку — так длинные тексты не превращаются в кашу в ячейках.
+    """
+    import pandas as pd
+
+    role = st.session_state.get("current_role", "manager")
+    if team and role not in ("rop", "admin"):
+        st.session_state.screen = "menu"
+        st.rerun()
+        return
+
+    title = "👥 Команда" if team else "📚 Моя история"
+    if team:
+        subtitle = "Тренировки сотрудников вашей компании" if role == "rop" else "Тренировки всех компаний"
+    else:
+        subtitle = "Ваши тренировки и разборы ИИ-судьи"
+
+    col_t, col_r, col_m = st.columns([4, 1, 1])
+    with col_t:
+        st.markdown(
+            f"<div style='font-size:24px;font-weight:800;color:#e8e8ff;'>{title}</div>"
+            f"<div style='font-size:13px;color:#505070;'>{subtitle}</div>",
+            unsafe_allow_html=True,
+        )
+    with col_r:
+        if st.button("🔄 Обновить", use_container_width=True, key="hist_refresh"):
+            _fetch_sessions_cached.clear()
+            st.rerun()
+    with col_m:
+        if st.button("← Меню", use_container_width=True, key="hist_back"):
+            st.session_state.screen = "menu"
+            st.rerun()
+
+    if not db_enabled():
+        st.warning("История не подключена: добавьте SUPABASE_URL и SUPABASE_KEY в Secrets.")
+        return
+
+    rows, err = fetch_sessions(team)
+    if err:
+        st.error(f"Не удалось загрузить историю: {err}")
+        return
+    if not rows:
+        st.info("Пока нет сохранённых тренировок. После первого разбора полётов запись появится здесь.")
+        return
+
+    def _short(text, n=140) -> str:
+        t = str(text or "").replace("\n", " ").strip()
+        return t if len(t) <= n else t[:n].rstrip() + "…"
+
+    records = []
+    for r in rows:
+        records.append({
+            "Дата (МСК)": _fmt_dt(r.get("created_at", "")),
+            "Сотрудник": r.get("user_login") or "—",
+            "Компания": r.get("company") or "—",
+            "Клиент": r.get("persona_name") or "—",
+            "Режим": "📞 Звонок" if r.get("mode") == "call" else "💬 Чат",
+            "Оценка": r.get("score"),
+            "Вывод": _short(r.get("summary")),
+            "_id": r.get("id"),
+        })
+    df = pd.DataFrame(records)
+    df["Оценка"] = pd.to_numeric(df["Оценка"], errors="coerce")
+
+    # ── Фильтры (только для команды) ─────────────────────────
+    filter_sig = "own"
+    if team:
+        f1, f2, f3 = st.columns(3)
+        employees = ["Все"] + sorted(df["Сотрудник"].unique().tolist())
+        personas = ["Все"] + sorted(df["Клиент"].unique().tolist())
+        with f1:
+            emp = st.selectbox("Сотрудник", employees, key="hist_f_emp")
+        with f2:
+            per = st.selectbox("Клиент", personas, key="hist_f_per")
+        comp = "Все"
+        if role == "admin":
+            companies = ["Все"] + sorted(df["Компания"].unique().tolist())
+            with f3:
+                comp = st.selectbox("Компания", companies, key="hist_f_comp")
+        mask = pd.Series(True, index=df.index)
+        if emp != "Все":
+            mask &= df["Сотрудник"] == emp
+        if per != "Все":
+            mask &= df["Клиент"] == per
+        if comp != "Все":
+            mask &= df["Компания"] == comp
+        df = df[mask]
+        filter_sig = f"{emp}|{per}|{comp}"
+        if df.empty:
+            st.info("По выбранным фильтрам ничего не найдено.")
+            return
+
+    view = df.reset_index(drop=True)
+
+    # ── Сводка ───────────────────────────────────────────────
+    scores = view["Оценка"].dropna()
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Тренировок", len(view))
+    m2.metric("Средний балл", f"{scores.mean():.1f}" if len(scores) else "—")
+    m3.metric("Лучший результат", f"{int(scores.max())} / 10" if len(scores) else "—")
+
+    if team:
+        st.markdown("##### 📈 По сотрудникам")
+        by_emp = (
+            view.groupby("Сотрудник")
+            .agg(Тренировок=("_id", "count"), Средний_балл=("Оценка", "mean"),
+                 Лучший=("Оценка", "max"), Последняя=("Дата (МСК)", "first"))
+            .reset_index()
+            .rename(columns={"Средний_балл": "Средний балл"})
+            .sort_values("Тренировок", ascending=False)
+        )
+        by_emp["Средний балл"] = by_emp["Средний балл"].round(1)
+        st.dataframe(by_emp, hide_index=True, use_container_width=True)
+
+    # ── Таблица тренировок ───────────────────────────────────
+    st.markdown("##### 🗂 Тренировки")
+    st.caption("Нажмите на строку, чтобы открыть полный разбор и диалог.")
+    if team:
+        cols = ["Дата (МСК)", "Сотрудник"] + (["Компания"] if role == "admin" else []) + ["Клиент", "Режим", "Оценка", "Вывод"]
+    else:
+        cols = ["Дата (МСК)", "Клиент", "Режим", "Оценка", "Вывод"]
+    table = view[cols]
+
+    # Ключ зависит от набора данных: при смене фильтров/обновлении выбор строки сбрасывается
+    table_key = f"hist_table_{team}_{abs(hash((filter_sig, len(view), str(view.iloc[0]['_id']))))}"
+    event = st.dataframe(
+        table,
+        hide_index=True,
+        use_container_width=True,
+        on_select="rerun",
+        selection_mode="single-row",
+        key=table_key,
+        column_config={
+            "Оценка": st.column_config.NumberColumn("Оценка", format="%d / 10", width="small"),
+            "Вывод": st.column_config.TextColumn("Вывод", width="large"),
+        },
+    )
+
+    if team:
+        st.download_button(
+            "⬇️ Выгрузить таблицу (CSV для Excel)",
+            data=table.to_csv(index=False).encode("utf-8-sig"),
+            file_name="kosmos_team_table.csv",
+            mime="text/csv",
+        )
+
+    # ── Подробный разбор выбранной тренировки ────────────────
+    selected = []
+    try:
+        selected = list(event.selection.rows)
+    except Exception:
+        pass
+    if not selected:
+        return
+    idx = selected[0]
+    if not (0 <= idx < len(view)):
+        return
+
+    detail, derr = fetch_session_detail(str(view.iloc[idx]["_id"]), team)
+    if derr or not detail:
+        st.error(f"Не удалось открыть запись: {derr}")
+        return
+
+    st.divider()
+    persona_obj = PERSONAS.get(detail.get("persona_key") or "")
+    p_emoji = persona_obj.emoji if persona_obj else "🤖"
+    who = f" · {detail.get('user_login')}" if team else ""
+    st.markdown(
+        f"<div style='font-size:20px;font-weight:800;color:#e8e8ff;margin-bottom:2px;'>"
+        f"Разбор полётов — {p_emoji} {detail.get('persona_name', '')}</div>"
+        f"<div style='font-size:13px;color:#505070;margin-bottom:10px;'>"
+        f"{_fmt_dt(detail.get('created_at', ''))} (МСК){who} · {detail.get('topic', '')} · "
+        f"{'📞 звонок' if detail.get('mode') == 'call' else '💬 чат'}</div>",
+        unsafe_allow_html=True,
+    )
+    if detail.get("is_partial"):
+        st.warning("⚠️ Ответ ИИ-судьи был обрезан при сохранении, часть полей может отсутствовать.")
+
+    render_review_body(detail)
+
+    transcript = detail.get("transcript") or []
+    with st.expander(f"📜 Полный диалог ({len(transcript)} реплик)"):
+        for m in transcript:
+            speaker = "👤 Менеджер" if m.get("role") == "manager" else f"{p_emoji} {detail.get('persona_name', 'Клиент')}"
+            st.markdown(f"**{speaker}:** {m.get('text', '')}")
+
+
+# ============================================================
 #  РОУТЕР ЭКРАНОВ
 # ============================================================
 screen = st.session_state.screen
@@ -2650,6 +3158,10 @@ elif screen == "call":
     screen_call()
 elif screen == "review":
     screen_review()
+elif screen == "history":
+    screen_history(team=False)
+elif screen == "team":
+    screen_history(team=True)
 else:
     st.session_state.screen = "menu"
     st.rerun()
