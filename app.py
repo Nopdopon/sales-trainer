@@ -83,16 +83,6 @@ def _set_tts_error(msg: Optional[str]) -> None:
         pass
 
 
-# Резервные голоса: если Яндекс отклонил голос ("Unsupported voice"), пробуем надёжный
-# голос того же пола, чтобы персонаж не оставался без озвучки.
-VOICE_FALLBACKS = {
-    # женские -> alena
-    "julia": "alena", "dasha": "alena", "marina": "alena", "lera": "alena", "masha": "alena",
-    # мужские -> filipp
-    "zahar": "filipp", "madi_ru": "filipp", "madirus": "filipp", "ermil": "filipp",
-}
-
-
 def text_to_speech(text: str, voice_name: str = "filipp") -> Optional[bytes]:
     """
     Отправляет текст в Yandex SpeechKit (Yandex AI Studio) и возвращает байты MP3.
@@ -102,9 +92,8 @@ def text_to_speech(text: str, voice_name: str = "filipp") -> Optional[bytes]:
         voice_name — техническое имя голоса Yandex (например "filipp", "alena" и т.д.),
                      закреплённое за конкретным персонажем.
 
-    Если Яндекс не принимает голос — автоматически пробуется резервный голос того же пола
-    (см. VOICE_FALLBACKS). При полном сбое возвращает None (приложение не падает), а причина
-    записывается в st.session_state["tts_error"] и показывается под чатом.
+    При сбое возвращает None (приложение не падает), а причина записывается в
+    st.session_state["tts_error"] и показывается пользователю под чатом.
     """
     api_key, folder_id = _get_yandex_credentials()
     if not api_key or not folder_id:
@@ -117,42 +106,31 @@ def text_to_speech(text: str, voice_name: str = "filipp") -> Optional[bytes]:
     if not clean:
         return None
 
-    headers = {"Authorization": f"Api-Key {api_key}"}
+    headers = {
+        "Authorization": f"Api-Key {api_key}",
+    }
+    base = {
+        "text": clean,
+        "lang": "ru-RU",
+        "voice": voice_name,
+        "format": "mp3",
+    }
 
-    voices_to_try = [voice_name]
-    fallback = VOICE_FALLBACKS.get(voice_name)
-    if fallback and fallback != voice_name:
-        voices_to_try.append(fallback)
-
+    # 1-я попытка — как в задании (с folderId). Если Яндекс не принял запрос, пробуем без
+    # folderId: для API-ключа сервисного аккаунта он не обязателен и иногда вызывает отказ.
+    attempts = [dict(base, folderId=folder_id), dict(base)]
     last_error = "неизвестная ошибка"
-    for voice in voices_to_try:
-        # 1-я попытка — как в задании (с folderId). Если не приняли, пробуем без него:
-        # для API-ключа сервисного аккаунта он не обязателен.
-        for use_folder in (True, False):
-            payload = {"text": clean, "lang": "ru-RU", "voice": voice, "format": "mp3"}
-            if use_folder:
-                payload["folderId"] = folder_id
-            try:
-                response = requests.post(YANDEX_TTS_URL, headers=headers, data=payload, timeout=20)
-            except Exception as ex:
-                last_error = f"нет связи с Яндексом ({type(ex).__name__})"
-                continue
-
-            if response.status_code == 200 and response.content:
-                _set_tts_error(None)
-                try:
-                    st.session_state["tts_notice"] = (
-                        None if voice == voice_name
-                        else f"голос «{voice_name}» недоступен, использован «{voice}»"
-                    )
-                except Exception:
-                    pass
-                return response.content
-
-            body = (response.text or "").strip().replace("\n", " ")[:300]
-            last_error = f"Яндекс ответил {response.status_code}: {body}"
-            if "unsupported voice" in body.lower():
-                break  # повтор без folderId бесполезен — переходим к резервному голосу
+    for payload in attempts:
+        try:
+            response = requests.post(YANDEX_TTS_URL, headers=headers, data=payload, timeout=20)
+        except Exception as ex:
+            last_error = f"нет связи с Яндексом ({type(ex).__name__})"
+            continue
+        if response.status_code == 200 and response.content:
+            _set_tts_error(None)
+            return response.content
+        body = (response.text or "").strip().replace("\n", " ")[:300]
+        last_error = f"Яндекс ответил {response.status_code}: {body}"
 
     _set_tts_error(last_error)
     return None
@@ -175,8 +153,6 @@ def play_pending_tts_audio() -> None:
     err = st.session_state.get("tts_error")
     if err:
         st.caption(f"🔇 Озвучка недоступна: {err}")
-    elif st.session_state.get("tts_notice") and _auth_debug_enabled():
-        st.caption(f"ℹ️ {st.session_state.tts_notice}")
 
 
 def _save_audio_to_tempfile(audio_bytes: bytes) -> Optional[str]:
@@ -257,7 +233,7 @@ CLIENTS_DB: Dict[str, Persona] = {
         emoji="🙂",
         avatar_url="",
         gender="male",
-        voice="madi_ru",
+        voice="madirus",
         level="Новичок",
         level_color="#22c55e",
         call_type="Тёплый",
@@ -293,7 +269,7 @@ CLIENTS_DB: Dict[str, Persona] = {
         emoji="😟",
         avatar_url="https://images.unsplash.com/photo-1500648767791-00dcc994a43e?w=150",
         gender="male",
-        voice="madi_ru",
+        voice="madirus",
         level="Новичок",
         level_color="#22c55e",
         call_type="Тёплый",
@@ -330,7 +306,7 @@ CLIENTS_DB: Dict[str, Persona] = {
         emoji="🧐",
         avatar_url="",
         gender="female",
-        voice="marina",
+        voice="julia",
         level="Опытный",
         level_color="#f59e0b",
         call_type="Холодный",
@@ -586,7 +562,7 @@ CLIENTS_DB: Dict[str, Persona] = {
         emoji="🔧",
         avatar_url="https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?w=150",
         gender="male",
-        voice="madi_ru",
+        voice="madirus",
         level="Хардкор",
         level_color="#ef4444",
         call_type="Холодный B2B",
@@ -622,7 +598,7 @@ CLIENTS_DB: Dict[str, Persona] = {
         emoji="💰",
         avatar_url="https://images.unsplash.com/photo-1580489944761-15a19d654956?w=150",
         gender="female",
-        voice="marina",
+        voice="julia",
         level="Опытный",
         level_color="#f59e0b",
         call_type="Холодный B2B",
@@ -659,7 +635,7 @@ CLIENTS_DB: Dict[str, Persona] = {
         emoji="😴",
         avatar_url="https://images.unsplash.com/photo-1472099645785-5658abf4ff4e?w=150",
         gender="male",
-        voice="madi_ru",
+        voice="madirus",
         level="Новичок",
         level_color="#22c55e",
         call_type="Холодный B2B",
